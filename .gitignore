@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.installed.cfg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Local llmchat data — never commit these.
+# Users' chat logs and routing configs are personal.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+sessions.db*
+routing.toml
+input_history
+.llmchat/
