@@ -17,7 +17,7 @@ from ..mcp.types import (
     StreamEvent, TextDelta, ToolCall, ToolDescriptor,
     ToolUseRequest, TurnEnd,
 )
-from .base import ChatMessage, Provider, ProviderError
+from .base import ChatMessage, Provider, ProviderError, RateLimitError
 
 
 _KNOWN_MODELS = (
@@ -89,6 +89,8 @@ class OpenAIProvider(Provider):
                 if text:
                     yield text
         except Exception as e:
+            if getattr(e, "status_code", None) == 429:
+                raise RateLimitError(f"OpenAI rate limit: {e}") from e
             raise ProviderError(f"OpenAI API error: {e}") from e
 
     # ----- tool-calling path ------------------------------------------------
@@ -107,6 +109,8 @@ class OpenAIProvider(Provider):
                 stream=True,
             )
         except Exception as e:
+            if getattr(e, "status_code", None) == 429:
+                raise RateLimitError(f"OpenAI rate limit: {e}") from e
             raise ProviderError(f"OpenAI API error: {e}") from e
 
         # Accumulate tool_calls across delta chunks. The stream sends
@@ -140,6 +144,8 @@ class OpenAIProvider(Provider):
                 if choice.finish_reason:
                     finish_reason = choice.finish_reason
         except Exception as e:
+            if getattr(e, "status_code", None) == 429:
+                raise RateLimitError(f"OpenAI rate limit: {e}") from e
             raise ProviderError(f"OpenAI streaming error: {e}") from e
 
         if tool_calls_acc:

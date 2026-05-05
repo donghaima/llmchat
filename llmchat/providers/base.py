@@ -47,6 +47,10 @@ class ProviderError(Exception):
     """Anything that goes wrong inside a provider call."""
 
 
+class RateLimitError(ProviderError):
+    """Provider rejected the request due to rate limits or quota exhaustion."""
+
+
 class Provider(ABC):
     name: str
     supports_tools: bool = False

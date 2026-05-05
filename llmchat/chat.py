@@ -31,7 +31,7 @@ from .mcp import ApprovalState, MCPManager, ToolCall, ToolResult
 from .mcp.approval import ApprovalDecision
 from .mcp.types import StreamEvent, TextDelta, ToolUseRequest, TurnEnd
 from .providers import (
-    ChatMessage, ProviderError, get_provider, parse_model,
+    ChatMessage, ProviderError, RateLimitError, get_provider, parse_model,
 )
 from .routing import Router, RoutingConfig
 from .storage import Session, Store
@@ -45,18 +45,19 @@ This protects against runaway loops."""
 
 HELP_TEXT = """\
 Commands:
-  /model <provider>:<name>   Pin a specific model (disables auto-routing)
-  /auto                      Re-engage automatic routing
-  /route on|off|show         Turn routing on/off, or show current config
-  /tools                     List MCP tools currently available
-  /plugins                   List loaded plugins/skills/commands/hooks
-  /system <text>             Set or replace the system prompt
-  /title <text>              Rename this session
-  /clear                     Start a new session (current one stays saved)
-  /history                   Show all messages in this session
-  /<custom>                  Run a custom slash command (see /plugins)
-  /help                      Show this help
-  /exit                      Quit (Ctrl-D also works)
+  /model <provider>:<name>           Pin a specific model (disables auto-routing)
+  /auto                              Re-engage automatic routing
+  /route on|off|show                 Turn routing on/off, or show current config
+  /compare <model1> <model2> [...]   Send next message to multiple models in parallel
+  /tools                             List MCP tools currently available
+  /plugins                           List loaded plugins/skills/commands/hooks
+  /system <text>                     Set or replace the system prompt
+  /title <text>                      Rename this session
+  /clear                             Start a new session (current one stays saved)
+  /history                           Show all messages in this session
+  /<custom>                          Run a custom slash command (see /plugins)
+  /help                              Show this help
+  /exit                              Quit (Ctrl-D also works)
 """
 
 
@@ -74,6 +75,7 @@ class ChatState:
     session: Session
     pinned_model: str | None  # set by /model, cleared by /auto
     approval: ApprovalState
+    compare_models: list[str] | None = None  # set by /compare, cleared after use
 
 
 class ChatLoop:
@@ -181,6 +183,10 @@ class ChatLoop:
             self._cmd_route(arg)
             return "handled"
 
+        if cmd == "/compare":
+            self._cmd_compare(arg)
+            return "handled"
+
         if cmd == "/system":
             self._cmd_system(arg)
             return "handled"
@@ -255,6 +261,33 @@ class ChatLoop:
             self._print_routing_config()
         else:
             self.console.print("[red]/route expects: on, off, or show[/red]")
+
+    def _cmd_compare(self, arg: str) -> None:
+        if not arg:
+            if self.state.compare_models:
+                self.state.compare_models = None
+                self.console.print("[dim]Compare mode off.[/dim]")
+            else:
+                self.console.print(
+                    "[dim]Usage: /compare model1 model2 ...[/dim]")
+            return
+        specs = arg.split()
+        valid: list[str] = []
+        for spec in specs:
+            try:
+                pname, mname = parse_model(spec)
+                get_provider(pname)
+                valid.append(f"{pname}:{mname}")
+            except ProviderError as e:
+                self.console.print(f"[red]{spec}: {e}[/red]")
+                return
+        if len(valid) < 2:
+            self.console.print("[red]/compare needs at least 2 models.[/red]")
+            return
+        self.state.compare_models = valid
+        models_str = ", ".join(f"[cyan]{m}[/cyan]" for m in valid)
+        self.console.print(
+            f"[green]Compare mode set.[/green] Next message → {models_str}")
 
     def _cmd_system(self, arg: str) -> None:
         new_system = arg or None
@@ -355,13 +388,27 @@ class ChatLoop:
             return
         text = hook_result.transformed_payload or raw_text
 
-        # 2. Decide whether tools should be in play. We expose tools whenever
-        # any MCP server is connected. The router will then steer to a tools-
-        # capable tier.
+        # 2. Decide whether tools should be in play.
         tools = self.ext.mcp_manager.list_tools()
         need_tools = bool(tools)
 
-        # 3. Pick a model.
+        # 5 (early). Build system prompt — needed by both paths below.
+        active_skills = self.ext.skills.select_for(text)
+        system_prompt = self._compose_system_prompt(active_skills)
+
+        # Compare mode: send this prompt to multiple models in parallel,
+        # then clear the flag so the next turn is normal.
+        if self.state.compare_models:
+            compare_models = self.state.compare_models
+            self.state.compare_models = None
+            self.store.add_message(
+                self.state.session.id, "user", text, model=compare_models[0])
+            self.console.print()
+            self._handle_compare_turn(text, compare_models, system_prompt)
+            self.console.print()
+            return
+
+        # 3. Pick a model via routing (or pinned override).
         try:
             model, explanation = self._resolve_model_for_turn(text, need_tools)
         except ValueError as e:
@@ -371,30 +418,43 @@ class ChatLoop:
         # 4. Persist the user message.
         self.store.add_message(self.state.session.id, "user", text, model=model)
 
-        # 5. Build system prompt: session prompt + active skills.
-        active_skills = self.ext.skills.select_for(text)
-        system_prompt = self._compose_system_prompt(active_skills)
-
-        # 6. Run the agentic loop (handles single-shot text or tool round-trips).
-        provider_name, model_name = parse_model(model)
-        try:
-            provider = get_provider(provider_name)
-        except ProviderError as e:
-            self.console.print(f"[red]{e}[/red]")
-            return
-
         self.console.print()
         if explanation:
             self.console.print(f"[dim]→ {model} · {explanation}[/dim]")
         else:
             self.console.print(f"[dim]assistant · {model}[/dim]")
 
-        final_text = self._run_agentic_loop(
-            provider=provider, model_name=model_name, model_label=model,
-            system_prompt=system_prompt, tools=tools)
+        # 6. Run agentic loop, escalating to the next tier on rate limits.
+        tried: list[str] = []
+        current_model = model
+        final_text = ""
+        while True:
+            provider_name, model_name = parse_model(current_model)
+            try:
+                provider = get_provider(provider_name)
+            except ProviderError as e:
+                self.console.print(f"[red]{e}[/red]")
+                return
+            tried.append(current_model)
+            try:
+                final_text = self._run_agentic_loop(
+                    provider=provider, model_name=model_name,
+                    model_label=current_model,
+                    system_prompt=system_prompt, tools=tools)
+                break
+            except RateLimitError:
+                next_model = self._failover_model(current_model, tried)
+                if next_model is None:
+                    self.console.print(
+                        f"[red]Rate limited on {current_model} "
+                        f"and no fallback available.[/red]")
+                    return
+                self.console.print(
+                    f"[yellow]Rate limited on {current_model} "
+                    f"→ failing over to {next_model}[/yellow]")
+                current_model = next_model
 
-        # 7. post_assistant_message hooks (informational only — we don't
-        # transform what we already showed the user).
+        # 7. post_assistant_message hooks.
         if final_text:
             self.ext.hooks.dispatch(
                 HookEvent.POST_ASSISTANT_MESSAGE, final_text)
@@ -406,6 +466,76 @@ class ChatLoop:
         addition = self.ext.skills.render_system_prompt_addition(active_skills)
         combined = "\n\n".join(p for p in (base, addition) if p)
         return combined or None
+
+    def _failover_model(self, current_model: str,
+                        already_tried: list[str]) -> str | None:
+        """Return the next-tier model to try after a rate limit, or None."""
+        order = ["local", "cheap", "flagship"]
+        current_idx = -1
+        for i, t in enumerate(order):
+            tier = self.routing_config.tiers.get(t)
+            if tier and tier.model == current_model:
+                current_idx = i
+                break
+        for t in order[current_idx + 1:]:
+            tier = self.routing_config.tiers.get(t)
+            if tier and tier.model and tier.model not in already_tried:
+                return tier.model
+        return None
+
+    def _handle_compare_turn(self, text: str, models: list[str],
+                              system_prompt: str | None) -> None:
+        """Query multiple models in parallel and display results as panels."""
+        import threading
+
+        api_messages = self._load_history_as_messages()
+        results: dict[str, str] = {}
+        errors: dict[str, str] = {}
+        lock = threading.Lock()
+
+        def run_one(model_label: str) -> None:
+            provider_name, model_name = parse_model(model_label)
+            try:
+                provider = get_provider(provider_name)
+            except ProviderError as e:
+                with lock:
+                    errors[model_label] = str(e)
+                return
+            chunks: list[str] = []
+            try:
+                for chunk in provider.stream(
+                        model=model_name, messages=api_messages,
+                        system=system_prompt, tools=None):
+                    if isinstance(chunk, str):
+                        chunks.append(chunk)
+            except ProviderError as e:
+                with lock:
+                    errors[model_label] = str(e)
+                return
+            with lock:
+                results[model_label] = "".join(chunks)
+
+        self.console.print(
+            f"[dim]Querying {len(models)} models in parallel…[/dim]")
+        threads = [threading.Thread(target=run_one, args=(m,), daemon=True)
+                   for m in models]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        for model_label in models:
+            if model_label in errors:
+                self.console.print(Panel(
+                    f"[red]{errors[model_label]}[/red]",
+                    title=f"[red]{model_label} — error[/red]",
+                    border_style="red"))
+            elif model_label in results:
+                self.console.print(Panel(
+                    results[model_label],
+                    title=f"[cyan]{model_label}[/cyan]",
+                    border_style="cyan"))
+                self._store_assistant_turn(results[model_label], [], model_label)
 
     # ----- agentic loop -----------------------------------------------------
 
@@ -450,6 +580,8 @@ class ChatLoop:
                         elif isinstance(ev, TurnEnd):
                             stop_reason = ev.stop_reason
                     self.console.print()
+            except RateLimitError:
+                raise  # propagate so _handle_user_turn can attempt failover
             except ProviderError as e:
                 self.console.print(f"\n[red]Error: {e}[/red]")
                 break

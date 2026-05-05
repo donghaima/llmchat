@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from .base import ChatMessage, Provider, ProviderError
+from .base import ChatMessage, Provider, ProviderError, RateLimitError
 
 
 # Default provider when the user gives a bare model name (no "provider:" prefix).
@@ -54,6 +54,7 @@ __all__ = [
     "ChatMessage",
     "Provider",
     "ProviderError",
+    "RateLimitError",
     "get_provider",
     "parse_model",
     "all_provider_names",

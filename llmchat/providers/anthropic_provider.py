@@ -25,7 +25,7 @@ from ..mcp.types import (
     StreamEvent, TextDelta, ToolCall, ToolDescriptor,
     ToolUseRequest, TurnEnd,
 )
-from .base import ChatMessage, Provider, ProviderError
+from .base import ChatMessage, Provider, ProviderError, RateLimitError
 
 
 _KNOWN_MODELS = (
@@ -92,6 +92,8 @@ class AnthropicProvider(Provider):
                 for text in stream.text_stream:
                     yield text
         except Exception as e:
+            if getattr(e, "status_code", None) == 429:
+                raise RateLimitError(f"Anthropic rate limit: {e}") from e
             raise ProviderError(f"Anthropic API error: {e}") from e
 
     # ----- tool-calling path ------------------------------------------------
@@ -136,6 +138,8 @@ class AnthropicProvider(Provider):
                     yield ToolUseRequest(calls=tool_uses)
                 yield TurnEnd(stop_reason=getattr(final, "stop_reason", None))
         except Exception as e:
+            if getattr(e, "status_code", None) == 429:
+                raise RateLimitError(f"Anthropic rate limit: {e}") from e
             raise ProviderError(f"Anthropic API error: {e}") from e
 
     # ----- message translation ---------------------------------------------

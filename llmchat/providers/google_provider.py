@@ -22,7 +22,7 @@ from ..mcp.types import (
     StreamEvent, TextDelta, ToolCall, ToolDescriptor,
     ToolUseRequest, TurnEnd,
 )
-from .base import ChatMessage, Provider, ProviderError
+from .base import ChatMessage, Provider, ProviderError, RateLimitError
 
 
 _KNOWN_MODELS = (
@@ -92,6 +92,9 @@ class GoogleProvider(Provider):
                 if text:
                     yield text
         except Exception as e:
+            if (getattr(e, "status_code", None) == 429
+                    or type(e).__name__ == "ResourceExhausted"):
+                raise RateLimitError(f"Google rate limit: {e}") from e
             raise ProviderError(f"Google API error: {e}") from e
 
     # ----- tool-calling path ------------------------------------------------
@@ -137,6 +140,9 @@ class GoogleProvider(Provider):
                     if fr is not None:
                         finish_reason = str(fr)
         except Exception as e:
+            if (getattr(e, "status_code", None) == 429
+                    or type(e).__name__ == "ResourceExhausted"):
+                raise RateLimitError(f"Google rate limit: {e}") from e
             raise ProviderError(f"Google API error: {e}") from e
 
         if captured_calls:
