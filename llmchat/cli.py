@@ -16,6 +16,7 @@ Subcommands:
 
 from __future__ import annotations
 
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -24,12 +25,22 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from .chat import run_chat
+from .chat import ExtensionsBundle, run_chat
 from .config import (
     config_path_for,
     load_routing_config,
     write_default_config,
 )
+from .extensions import (
+    HookEvent,
+    discover_roots,
+    load_commands,
+    load_hooks,
+    load_plugins,
+    load_skills,
+)
+from .extensions.plugins import merge_plugins_into
+from .mcp.manager import MCPManager, load_mcp_configs
 from .providers import (
     ChatMessage,
     all_provider_names,
@@ -99,7 +110,8 @@ def new(ctx: click.Context) -> None:
         title=ctx.obj["title"],
         system_prompt=ctx.obj["system"],
     )
-    run_chat(store, session, routing_config, pinned_model=pinned)
+    extensions = _build_extensions()
+    run_chat(store, session, routing_config, extensions, pinned_model=pinned)
 
 
 @cli.command()
@@ -119,7 +131,8 @@ def resume(ctx: click.Context, session_id: str) -> None:
         full = f"{provider_name}:{model_name}"
         store.update_session_model(session.id, full)
         session.current_model = full
-    run_chat(store, session, routing_config, pinned_model=pinned)
+    extensions = _build_extensions()
+    run_chat(store, session, routing_config, extensions, pinned_model=pinned)
 
 
 @cli.command(name="list")
@@ -353,7 +366,175 @@ def route_test(ctx: click.Context, prompt: str, history: tuple[str, ...]) -> Non
         console.print(f"  → reasons: (default tier)")
 
 
+# ----- plugins subcommands --------------------------------------------------
+
+@cli.group()
+def plugins() -> None:
+    """Manage extensions: plugins, skills, commands, and hooks."""
+
+
+@plugins.command(name="list")
+def plugins_list_cmd() -> None:
+    """List all loaded plugins, skills, commands, and hooks."""
+    roots = discover_roots()
+    skills = load_skills(roots)
+    commands = load_commands(roots)
+    hooks = load_hooks(roots)
+    loaded_plugins = load_plugins(roots)
+    merge_plugins_into(loaded_plugins, skills, commands, hooks)
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("type", style="cyan")
+    table.add_column("name")
+    table.add_column("detail", style="dim")
+
+    for sk in skills.all():
+        trigger = ("always" if sk.is_always_on() else
+                   f"triggers: {', '.join(sk.triggers)}" if sk.triggers else
+                   f"patterns: {', '.join(sk.file_patterns)}")
+        table.add_row("skill", sk.name, trigger)
+
+    for cmd in commands.values():
+        table.add_row("command", f"/{cmd.name}", cmd.description)
+
+    for event, hook_list in hooks.by_event.items():
+        for h in hook_list:
+            table.add_row("hook", event.value, " ".join(h.command))
+
+    for plugin in loaded_plugins:
+        table.add_row("plugin", plugin.name,
+                      f"v{plugin.version}  {plugin.description}")
+
+    if table.row_count == 0:
+        console.print(
+            "[dim]No extensions found. Add skills/commands/hooks under "
+            "~/.llmchat/ or .llmchat/ in your project directory.[/dim]")
+    else:
+        console.print(table)
+
+
+@plugins.command(name="show")
+@click.argument("name")
+def plugins_show_cmd(name: str) -> None:
+    """Show details of a specific plugin."""
+    roots = discover_roots()
+    loaded_plugins = load_plugins(roots)
+    plugin = next((p for p in loaded_plugins if p.name == name), None)
+    if plugin is None:
+        console.print(f"[red]Plugin {name!r} not found.[/red]")
+        console.print("Run `llmchat plugins list` to see what's loaded.")
+        sys.exit(1)
+
+    console.print(f"[bold]{plugin.name}[/bold]  v{plugin.version}")
+    if plugin.description:
+        console.print(plugin.description)
+    console.print(f"[dim]root:[/dim] {plugin.root}")
+    if plugin.manifest_path:
+        console.print(f"[dim]manifest:[/dim] {plugin.manifest_path}")
+
+    plugin_roots = plugin.as_extension_root()
+    plugin_skills = load_skills(plugin_roots)
+    plugin_cmds = load_commands(plugin_roots)
+    plugin_hooks = load_hooks(plugin_roots)
+
+    if plugin_skills.skills:
+        console.print(f"\n[bold]skills ({len(plugin_skills.skills)})[/bold]")
+        for sk in plugin_skills.all():
+            console.print(f"  [cyan]{sk.name}[/cyan]  [dim]{sk.description}[/dim]")
+
+    if plugin_cmds:
+        console.print(f"\n[bold]commands ({len(plugin_cmds)})[/bold]")
+        for cmd in plugin_cmds.values():
+            console.print(f"  [cyan]/{cmd.name}[/cyan]  [dim]{cmd.description}[/dim]")
+
+    hook_total = sum(len(v) for v in plugin_hooks.by_event.values())
+    if hook_total:
+        console.print(f"\n[bold]hooks ({hook_total})[/bold]")
+        for event, hook_list in plugin_hooks.by_event.items():
+            for h in hook_list:
+                console.print(f"  [cyan]{event.value}[/cyan]: {' '.join(h.command)}")
+
+    mcp_path = plugin.mcp_config_path()
+    if mcp_path:
+        console.print(f"\n[bold]MCP config[/bold]  [dim]{mcp_path}[/dim]")
+        import json
+        try:
+            data = json.loads(mcp_path.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers") or data.get("mcp_servers") or {}
+            for sname in servers:
+                console.print(f"  [cyan]{sname}[/cyan]")
+        except Exception:
+            pass
+
+
+@plugins.command(name="install")
+@click.argument("source")
+@click.option("--project", "scope", flag_value="project",
+              help="Install into .llmchat/plugins/ in the current directory.")
+@click.option("--user", "scope", flag_value="user", default=True,
+              help="Install into ~/.llmchat/plugins/ (default).")
+def plugins_install_cmd(source: str, scope: str) -> None:
+    """Install a plugin from a local directory.
+
+    SOURCE is the path to the plugin directory. The directory is copied into
+    the user (~/.llmchat/plugins/) or project (.llmchat/plugins/) extension
+    root. The plugin name is taken from the directory name.
+    """
+    src = Path(source).resolve()
+    if not src.is_dir():
+        console.print(f"[red]Not a directory: {src}[/red]")
+        sys.exit(1)
+    if scope == "project":
+        dest_root = Path.cwd() / ".llmchat" / "plugins"
+    else:
+        dest_root = Path.home() / ".llmchat" / "plugins"
+
+    dest = dest_root / src.name
+    if dest.exists():
+        console.print(
+            f"[red]Plugin {src.name!r} already exists at {dest}.[/red] "
+            f"Remove it first or rename the source directory.")
+        sys.exit(1)
+
+    dest_root.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dest)
+    console.print(f"[green]Installed[/green] [cyan]{src.name!r}[/cyan] → {dest}")
+    console.print("Run `llmchat plugins list` to verify it loaded correctly.")
+
+
 # ----- helpers --------------------------------------------------------------
+
+def _build_extensions() -> ExtensionsBundle:
+    """Discover and load all extensions (skills, commands, hooks, plugins, MCP)."""
+    roots = discover_roots()
+    skills = load_skills(roots)
+    commands = load_commands(roots)
+    hooks = load_hooks(roots)
+    loaded_plugins = load_plugins(roots)
+    merge_plugins_into(loaded_plugins, skills, commands, hooks)
+
+    # Collect MCP configs from roots and plugins (last-wins for same server name).
+    mcp_paths: list[Path] = []
+    for root in roots.existing():
+        for name in (".mcp.json", "mcp.json"):
+            p = root / name
+            if p.is_file():
+                mcp_paths.append(p)
+    for plugin in loaded_plugins:
+        p = plugin.mcp_config_path()
+        if p:
+            mcp_paths.append(p)
+
+    mcp_configs = load_mcp_configs(mcp_paths)
+    manager = MCPManager(mcp_configs)
+
+    return ExtensionsBundle(
+        skills=skills,
+        commands=commands,
+        hooks=hooks,
+        mcp_manager=manager,
+    )
+
 
 def _default_session_model(routing_config) -> str:
     """Pick a reasonable 'current_model' value for new sessions when no

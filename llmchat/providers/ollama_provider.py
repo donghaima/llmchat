@@ -1,8 +1,14 @@
 """Ollama provider for local models.
 
-Implemented against the Ollama HTTP API directly so we don't need a separate
-SDK. By default talks to ``http://localhost:11434``; override with
-``OLLAMA_HOST``.
+Most local models we'd want to use here don't have reliable tool-calling
+support. We mark ``supports_tools = False`` and the router will avoid
+sending tool-requiring turns to this provider. Plain chat works as before.
+
+If you're running a local model that does support tool-calling well (some
+recent llama.cpp + grammar-constrained setups do), opening up tool
+support here is straightforward — Ollama's chat endpoint accepts a
+``tools`` field — but reliability varies enough that we don't enable it
+by default.
 """
 
 from __future__ import annotations
@@ -22,15 +28,20 @@ def _host() -> str:
 
 class OllamaProvider(Provider):
     name = "ollama"
+    supports_tools = False
 
     def is_configured(self) -> bool:
-        # Ollama is "configured" if the daemon answers. We check lazily; for
-        # the `models` listing we attempt a connection and report failure
-        # there rather than blocking startup with a probe here.
         return True
 
-    def stream(self, model: str, messages: list[ChatMessage],
-               system: str | None = None) -> Iterator[str]:
+    def stream(self, model, messages, system=None, tools=None):
+        if tools:
+            # Router shouldn't have routed here; surface a clear error.
+            raise ProviderError(
+                "Ollama provider does not support tool calls. "
+                "Use a different model for this turn.")
+        yield from self._stream_text_only(model, messages, system)
+
+    def _stream_text_only(self, model, messages, system) -> Iterator[str]:
         api_messages: list[dict] = []
         if system:
             api_messages.append({"role": "system", "content": system})
@@ -69,8 +80,7 @@ class OllamaProvider(Provider):
         except URLError as e:
             raise ProviderError(
                 f"Cannot reach Ollama at {_host()}. "
-                f"Is the daemon running? ({e.reason})"
-            ) from e
+                f"Is the daemon running? ({e.reason})") from e
         except Exception as e:
             raise ProviderError(f"Ollama error: {e}") from e
 

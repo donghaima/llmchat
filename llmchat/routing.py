@@ -75,6 +75,13 @@ class Tier:
     model: str | None          # full "provider:model" string, or None if absent
     max_input_chars: int       # rough upper bound; above this, escalate
     description: str = ""
+    supports_tools: bool = True  # set False for Ollama-style local models
+    """Does this tier's model support tool calls?
+
+    The router uses this when ``need_tools`` is set on the route call: if
+    the prompt requires tools (because MCP servers are configured and the
+    model is expected to be able to call them), the router skips tiers
+    where ``supports_tools`` is False, even if they'd otherwise be picked."""
 
 
 @dataclass
@@ -128,7 +135,8 @@ class Router:
         self.config = config
 
     def route(self, new_prompt: str,
-              history: Iterable[ChatMessage]) -> RoutingDecision:
+              history: Iterable[ChatMessage],
+              need_tools: bool = False) -> RoutingDecision:
         history_list = list(history)
         history_chars = sum(len(m.content) for m in history_list)
         prompt_chars = len(new_prompt)
@@ -175,19 +183,27 @@ class Router:
             chosen_tier = self.config.default_tier
 
         # Clamp to what's actually available, escalating if our pick is missing.
-        chosen_tier, model = self._resolve(chosen_tier, reasons)
+        chosen_tier, model = self._resolve(chosen_tier, reasons,
+                                            need_tools=need_tools)
         return RoutingDecision(tier=chosen_tier, model=model, reasons=reasons)
 
-    def _resolve(self, requested: str, reasons: list[str]) -> tuple[str, str]:
+    def _resolve(self, requested: str, reasons: list[str],
+                 need_tools: bool = False) -> tuple[str, str]:
         """Map a requested tier to the closest available tier + concrete model.
 
-        Order is local -> cheap -> flagship. If we want "local" but the user
-        hasn't configured one, escalate up. If we want "flagship" but it's
-        missing, fall back down. Either way we annotate the reasons.
+        When ``need_tools`` is set, we filter out tiers whose configured
+        models don't support tool calling.
         """
         tiers = self.config.tiers
         order = ["local", "cheap", "flagship"]
         avail = self.config.available_tiers()
+        if need_tools:
+            avail = [t for t in avail
+                     if tiers[t].supports_tools]
+            if not avail:
+                raise ValueError(
+                    "Tools are required but no configured tier has "
+                    "supports_tools=True. Update routing.toml.")
         if not avail:
             raise ValueError(
                 "No tiers have a configured model. "
@@ -196,19 +212,15 @@ class Router:
         if requested in avail:
             return requested, tiers[requested].model  # type: ignore[return-value]
 
-        # Walk up first (cheaper -> more capable), then down.
         idx = order.index(requested)
-        # Prefer escalating: a more capable model is always a safe substitute.
         for t in order[idx + 1:]:
             if t in avail:
                 reasons.append(f"{requested} unavailable, escalated to {t}")
                 return t, tiers[t].model  # type: ignore[return-value]
-        # Otherwise fall back to the next-cheapest available.
         for t in reversed(order[:idx]):
             if t in avail:
                 reasons.append(f"{requested} unavailable, fell back to {t}")
                 return t, tiers[t].model  # type: ignore[return-value]
-        # Unreachable given the avail check above.
         raise RuntimeError("no available tier could be resolved")
 
 
@@ -222,7 +234,8 @@ def default_config() -> RoutingConfig:
                 name="local",
                 model="ollama:llama3.2",
                 max_input_chars=4_000,
-                description="Local model for quick lookups."),
+                description="Local model for quick lookups.",
+                supports_tools=False),
             "cheap": Tier(
                 name="cheap",
                 model="anthropic:claude-haiku-4-5",

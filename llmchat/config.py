@@ -92,6 +92,9 @@ def load_routing_config(db_path: Path) -> RoutingConfig:
             description=section.get(
                 "description",
                 existing.description if existing else ""),
+            supports_tools=bool(section.get(
+                "supports_tools",
+                existing.supports_tools if existing else True)),
         )
 
     return cfg
@@ -125,15 +128,18 @@ explain = true
 [tiers.local]
 model = "ollama:llama3.2"
 max_input_chars = 4000
+supports_tools = false
 description = "Local Ollama model for quick factual lookups"
 
 [tiers.cheap]
 model = "anthropic:claude-haiku-4-5"
 max_input_chars = 20000
+supports_tools = true
 description = "Fast, inexpensive paid model for everyday tasks"
 
 [tiers.flagship]
 model = "anthropic:claude-opus-4-7"
 max_input_chars = 200000
+supports_tools = true
 description = "Most capable model — for hard reasoning, long context, complex code"
 """

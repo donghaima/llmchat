@@ -184,6 +184,149 @@ Goroutine leaks happen when...
 Auto-routing re-enabled.
 ```
 
+## Extensions
+
+Extensions live under `~/.llmchat/` (user-level) and `./.llmchat/` (project-level).
+Project extensions override user-level ones when names conflict.
+Claude Code's `~/.claude/` and `./.claude/` directories are also scanned with the same precedence.
+
+### Skills
+
+Skills inject text into the system prompt when they match the user's message.
+Create a directory with a `SKILL.md` inside:
+
+```
+~/.llmchat/skills/code-reviewer/SKILL.md
+```
+
+```markdown
+---
+name: code-reviewer
+description: Reviews Python code for style and correctness.
+triggers:
+  - "review this"
+  - "check this code"
+---
+You are a senior Python code reviewer. When asked to review code, look for:
+- Off-by-one errors and edge cases
+- Type annotation completeness
+- ...
+```
+
+Frontmatter fields:
+
+| field | default | meaning |
+|-------|---------|---------|
+| `name` | directory name | identifier |
+| `description` | `""` | shown in `/plugins` |
+| `auto_invoke` | `true` | set `false` to disable the skill |
+| `triggers` | `[]` | phrases that activate the skill |
+| `file_patterns` | `[]` | glob patterns (`*.py`) that activate it |
+
+If no `triggers` or `file_patterns` are set and `auto_invoke` is `true`, the skill is always active.
+
+### Slash Commands
+
+Create a `.md` file in a `commands/` directory:
+
+```
+~/.llmchat/commands/pr.md
+```
+
+```markdown
+---
+description: Draft a pull request description for the current changes.
+---
+Run `git diff main` and write a PR title and description covering: $ARGS
+```
+
+Invoke with `/pr fix the auth race condition`. `$ARGS` is replaced with the text after the command name.
+
+### Hooks
+
+Hooks run shell commands at lifecycle events. Create `hooks.toml` in an extension root:
+
+```toml
+[[hooks]]
+event = "pre_user_message"
+command = ["./scripts/redact-secrets.sh"]
+timeout_seconds = 5
+
+[[hooks]]
+event = "post_assistant_message"
+command = ["tee", "-a", "chat.log"]
+```
+
+Events: `pre_user_message`, `post_assistant_message`, `pre_tool_call`, `post_tool_call`.
+
+- **pre_\*** hooks can transform their payload by writing to stdout, or block it by exiting non-zero.
+- **post_\*** hooks are informational only.
+
+### Plugins
+
+A plugin is a directory that bundles skills, commands, hooks, and optional MCP config:
+
+```
+~/.llmchat/plugins/my-plugin/
+  plugin.toml          # manifest (optional)
+  skills/my-skill/SKILL.md
+  commands/my-cmd.md
+  hooks.toml
+  .mcp.json            # MCP servers this plugin provides
+```
+
+Install a plugin from a local directory:
+
+```bash
+llmchat plugins install ./my-plugin          # → ~/.llmchat/plugins/
+llmchat plugins install ./my-plugin --project # → ./.llmchat/plugins/
+llmchat plugins list                          # verify it loaded
+llmchat plugins show my-plugin               # details
+```
+
+## MCP Tool Calling
+
+llmchat supports [Model Context Protocol](https://modelcontextprotocol.io) servers for tool
+calling. Configure servers in `.mcp.json` (or `mcp.json`) under any extension root:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "weather": {
+      "type": "http",
+      "url": "https://my-mcp-server.example.com/mcp"
+    }
+  }
+}
+```
+
+Supported transport types: `stdio` (default) and `http` / `streamable_http`.
+
+When servers are configured, tools are advertised to the model as `server::tool` names.
+The first time a tool is called in a session you'll be prompted:
+
+```
+Allow? [y/Y/n] (y=once, Y=session, n=deny) >
+```
+
+- `y` — approve this call only; you'll be prompted again next time
+- `Y` — approve this tool for the entire session
+- `n` — deny; the model receives an error result
+
+Use `/tools` to list connected servers and available tools. Tools require a
+`supports_tools = true` tier in your routing config (Anthropic and OpenAI tiers have
+this set by default; local/Ollama tiers do not).
+
+Install the MCP SDK to enable tool support:
+
+```bash
+pip install mcp
+```
+
 ## Storage layout
 
 By default, everything lives under `~/.llmchat/`:

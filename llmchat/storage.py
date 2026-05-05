@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS messages (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    role       TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    role       TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
     content    TEXT NOT NULL,
     model      TEXT,
     created_at REAL NOT NULL
@@ -69,11 +69,42 @@ class Message:
     created_at: float
 
 
+def _migrate_messages_schema(conn: sqlite3.Connection) -> None:
+    """Add 'tool' to the messages role CHECK if missing (one-time migration).
+
+    SQLite can't ALTER a CHECK constraint, so we do the rename-recreate-copy
+    dance inside an explicit transaction.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'"
+    ).fetchone()
+    if row is None or "'tool'" in (row[0] or ""):
+        return
+    conn.executescript("""
+        BEGIN;
+        DROP INDEX IF EXISTS idx_messages_session;
+        ALTER TABLE messages RENAME TO _messages_old;
+        CREATE TABLE messages (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            role       TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
+            content    TEXT NOT NULL,
+            model      TEXT,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX idx_messages_session ON messages(session_id, id);
+        INSERT INTO messages SELECT * FROM _messages_old;
+        DROP TABLE _messages_old;
+        COMMIT;
+    """)
+
+
 class Store:
     def __init__(self, db_path: Path = DEFAULT_DB_PATH) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            _migrate_messages_schema(conn)
             conn.executescript(SCHEMA)
 
     @contextmanager

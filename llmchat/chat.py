@@ -1,26 +1,15 @@
-"""Interactive chat REPL.
+"""Interactive chat REPL with extensions and tool calling.
 
-Wires together the storage layer, the provider registry, the router, and the
-user's terminal. Every user prompt is persisted before the model is even
-called, and every assistant response is persisted as soon as the stream
-finishes — so a crash mid-stream costs at most one in-flight reply.
+Architecture in one paragraph: each user turn (1) optionally goes through
+``pre_user_message`` hooks, (2) gets matched against slash commands and
+expanded if applicable, (3) selects relevant skills and assembles a system
+prompt, (4) routes to a model tier, (5) runs the model — possibly through
+multiple agentic iterations if the model calls MCP tools — and (6) finally
+runs ``post_assistant_message`` hooks. Storage writes happen at every
+boundary so a crash anywhere costs at most one in-flight reply.
 
-Routing
--------
-By default, each turn passes through the heuristic Router, which picks the
-cheapest tier (local / cheap / flagship) that can plausibly handle the prompt.
-The decision is shown to the user when ``explain`` is on. The user can:
-
-  /model X      -> pin to model X for all subsequent turns (router off)
-  /auto         -> re-engage the router
-  /route off    -> turn routing off globally (sticks to current model)
-  /route on     -> turn it back on
-  /route show   -> dump the current routing config
-
-The router's pick is *not* persisted as `current_model` on the session;
-`current_model` reflects what the user has explicitly pinned (or the initial
-model). This way, resuming a session doesn't lock in an automatic choice from
-a prior turn.
+The agentic loop is bounded: at most ``MAX_TOOL_ITERATIONS`` round trips per
+turn, after which we surface what we have and let the user continue.
 """
 
 from __future__ import annotations
@@ -31,16 +20,27 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
+from rich.panel import Panel
 from rich.rule import Rule
+from rich.syntax import Syntax
 
+from .extensions import (
+    HookEvent, HookRegistry, SkillRegistry, SlashCommand,
+)
+from .mcp import ApprovalState, MCPManager, ToolCall, ToolResult
+from .mcp.approval import ApprovalDecision
+from .mcp.types import StreamEvent, TextDelta, ToolUseRequest, TurnEnd
 from .providers import (
-    ChatMessage,
-    ProviderError,
-    get_provider,
-    parse_model,
+    ChatMessage, ProviderError, get_provider, parse_model,
 )
 from .routing import Router, RoutingConfig
 from .storage import Session, Store
+
+
+MAX_TOOL_ITERATIONS = 10
+"""Hard cap on agentic round trips per user turn. If the model keeps asking
+for more tool calls past this, we surface the partial result and stop.
+This protects against runaway loops."""
 
 
 HELP_TEXT = """\
@@ -48,30 +48,46 @@ Commands:
   /model <provider>:<name>   Pin a specific model (disables auto-routing)
   /auto                      Re-engage automatic routing
   /route on|off|show         Turn routing on/off, or show current config
-  /system <text>             Set or replace the system prompt (empty to clear)
+  /tools                     List MCP tools currently available
+  /plugins                   List loaded plugins/skills/commands/hooks
+  /system <text>             Set or replace the system prompt
   /title <text>              Rename this session
   /clear                     Start a new session (current one stays saved)
   /history                   Show all messages in this session
+  /<custom>                  Run a custom slash command (see /plugins)
   /help                      Show this help
   /exit                      Quit (Ctrl-D also works)
 """
 
 
 @dataclass
+class ExtensionsBundle:
+    """Everything loaded from disk for this session."""
+    skills: SkillRegistry
+    commands: dict[str, SlashCommand]
+    hooks: HookRegistry
+    mcp_manager: MCPManager  # may be configured-but-empty if no servers
+
+
+@dataclass
 class ChatState:
     session: Session
     pinned_model: str | None  # set by /model, cleared by /auto
+    approval: ApprovalState
 
 
 class ChatLoop:
     def __init__(self, store: Store, session: Session,
                  routing_config: RoutingConfig,
+                 extensions: ExtensionsBundle,
                  console: Console | None = None) -> None:
         self.store = store
         self.console = console or Console()
         self.routing_config = routing_config
         self.router = Router(routing_config)
-        self.state = ChatState(session=session, pinned_model=None)
+        self.ext = extensions
+        self.state = ChatState(session=session, pinned_model=None,
+                               approval=ApprovalState())
 
         history_dir = store.db_path.parent
         history_dir.mkdir(parents=True, exist_ok=True)
@@ -102,159 +118,264 @@ class ChatLoop:
                 continue
 
             if line.startswith("/"):
-                if self._handle_command(line):
+                consumed = self._handle_command(line)
+                if consumed == "exit":
                     return
-                continue
+                if consumed == "handled":
+                    continue
+                # consumed == "expanded": fall through with a transformed text
+                line = self._last_expanded_text or line
 
             self._handle_user_turn(line)
 
+    _last_expanded_text: str | None = None
+
     # ----- model resolution -------------------------------------------------
 
-    def _resolve_model_for_turn(self, prompt: str) -> tuple[str, str | None]:
-        """Decide which model to use for this turn.
-
-        Returns (model, explanation). The explanation is None when the model
-        was pinned (manual choice) or when explanations are turned off.
-        """
-        # 1. Explicit user pin always wins.
+    def _resolve_model_for_turn(self, prompt: str, need_tools: bool
+                                 ) -> tuple[str, str | None]:
         if self.state.pinned_model:
             return self.state.pinned_model, None
-
-        # 2. Routing disabled -> fall back to whatever the session had.
         if not self.routing_config.enabled:
             return self.state.session.current_model, None
-
-        # 3. Run the router.
         history = self.store.get_messages(self.state.session.id)
         chat_history = [ChatMessage(role=m.role, content=m.content)
                         for m in history if m.role in ("user", "assistant")]
-        decision = self.router.route(prompt, chat_history)
+        decision = self.router.route(prompt, chat_history,
+                                      need_tools=need_tools)
         explanation = (decision.explanation()
                        if self.routing_config.explain else None)
         return decision.model, explanation
 
     # ----- commands ---------------------------------------------------------
 
-    def _handle_command(self, line: str) -> bool:
+    def _handle_command(self, line: str) -> str:
+        """Returns 'exit' to terminate, 'handled' if the command was a no-op
+        or status command, 'expanded' if a slash command was expanded into
+        a regular user prompt that should now be sent to the model."""
         parts = line.split(maxsplit=1)
         cmd = parts[0].lower()
         arg = parts[1] if len(parts) > 1 else ""
 
         if cmd in ("/exit", "/quit", "/q"):
-            return True
+            return "exit"
 
         if cmd == "/help":
             self.console.print(HELP_TEXT)
-            return False
+            return "handled"
 
         if cmd == "/model":
-            if not arg:
-                pinned = self.state.pinned_model
-                if pinned:
-                    self.console.print(f"Pinned model: [cyan]{pinned}[/cyan]")
-                else:
-                    self.console.print("[dim]No model pinned (auto-routing).[/dim]")
-                return False
-            try:
-                provider_name, model_name = parse_model(arg)
-                get_provider(provider_name)
-            except ProviderError as e:
-                self.console.print(f"[red]{e}[/red]")
-                return False
-            full = f"{provider_name}:{model_name}"
-            self.state.pinned_model = full
-            self.store.update_session_model(self.state.session.id, full)
-            self.console.print(
-                f"[green]Pinned to[/green] [cyan]{full}[/cyan] "
-                f"[dim](use /auto to re-enable routing)[/dim]")
-            return False
+            self._cmd_model(arg)
+            return "handled"
 
         if cmd == "/auto":
             self.state.pinned_model = None
             if not self.routing_config.enabled:
                 self.console.print(
-                    "[yellow]Routing is currently disabled in config — "
-                    "use /route on to enable it.[/yellow]")
-                return False
+                    "[yellow]Routing is disabled — /route on to enable.[/yellow]")
+                return "handled"
             self.console.print("[green]Auto-routing re-enabled.[/green]")
-            return False
+            return "handled"
 
         if cmd == "/route":
-            sub = arg.strip().lower()
-            if sub == "on":
-                self.routing_config.enabled = True
-                self.console.print("[green]Routing enabled.[/green]")
-            elif sub == "off":
-                self.routing_config.enabled = False
-                self.console.print(
-                    "[yellow]Routing disabled. "
-                    "Pinned model will be used for every turn.[/yellow]")
-            elif sub in ("", "show", "status"):
-                self._print_routing_config()
-            else:
-                self.console.print(
-                    "[red]/route expects: on, off, or show[/red]")
-            return False
+            self._cmd_route(arg)
+            return "handled"
 
         if cmd == "/system":
-            new_system = arg or None
-            self.store.update_system_prompt(self.state.session.id, new_system)
-            self.state.session.system_prompt = new_system
-            if new_system:
-                self.console.print("[green]System prompt set.[/green]")
-            else:
-                self.console.print("[green]System prompt cleared.[/green]")
-            return False
+            self._cmd_system(arg)
+            return "handled"
 
         if cmd == "/title":
-            if not arg:
-                self.console.print(
-                    f"Current title: [cyan]{self.state.session.title}[/cyan]")
-                return False
-            self.store.update_session_title(self.state.session.id, arg)
-            self.state.session.title = arg
-            self.console.print(f"[green]Title set to[/green] [cyan]{arg}[/cyan]")
-            return False
+            self._cmd_title(arg)
+            return "handled"
 
         if cmd == "/clear":
-            new_sess = self.store.create_session(
-                model=self.state.session.current_model,
-                title="New chat",
-                system_prompt=self.state.session.system_prompt,
-            )
-            self.state.session = new_sess
-            self.console.print(
-                f"[green]New session[/green] [dim]{new_sess.id}[/dim]")
-            self._print_header()
-            return False
+            self._cmd_clear()
+            return "handled"
 
         if cmd == "/history":
-            msgs = self.store.get_messages(self.state.session.id)
-            if not msgs:
-                self.console.print("[dim](no messages yet)[/dim]")
-                return False
-            for m in msgs:
-                style = "cyan" if m.role == "user" else "green"
-                tag = m.role
-                if m.model:
-                    tag += f" · {m.model}"
-                self.console.print(Rule(f"[{style}]{tag}[/{style}]"))
-                self.console.print(m.content)
-            return False
+            self._cmd_history()
+            return "handled"
+
+        if cmd == "/tools":
+            self._cmd_tools()
+            return "handled"
+
+        if cmd == "/plugins":
+            self._cmd_plugins()
+            return "handled"
+
+        # User-defined slash command?
+        custom_name = cmd.lstrip("/")
+        custom = self.ext.commands.get(custom_name)
+        if custom is not None:
+            expanded = custom.expand(arg)
+            self.console.print(
+                f"[dim]→ /{custom.name}: expanded to "
+                f"{len(expanded)} chars[/dim]")
+            self._last_expanded_text = expanded
+            return "expanded"
 
         self.console.print(f"[red]Unknown command:[/red] {cmd}. Type /help.")
-        return False
+        return "handled"
 
-    # ----- chat turn --------------------------------------------------------
+    # Detail handlers split out for readability.
 
-    def _handle_user_turn(self, text: str) -> None:
-        # Pick a model BEFORE persisting, so the router has a chance to look
-        # at the prompt. We persist the user message immediately afterward so
-        # the prompt is durable even if the model call crashes.
-        model, explanation = self._resolve_model_for_turn(text)
+    def _cmd_model(self, arg: str) -> None:
+        if not arg:
+            pinned = self.state.pinned_model
+            if pinned:
+                self.console.print(f"Pinned model: [cyan]{pinned}[/cyan]")
+            else:
+                self.console.print("[dim]No model pinned (auto-routing).[/dim]")
+            return
+        try:
+            provider_name, model_name = parse_model(arg)
+            get_provider(provider_name)
+        except ProviderError as e:
+            self.console.print(f"[red]{e}[/red]")
+            return
+        full = f"{provider_name}:{model_name}"
+        self.state.pinned_model = full
+        self.store.update_session_model(self.state.session.id, full)
+        self.console.print(
+            f"[green]Pinned to[/green] [cyan]{full}[/cyan] "
+            f"[dim](use /auto to re-enable routing)[/dim]")
 
+    def _cmd_route(self, arg: str) -> None:
+        sub = arg.strip().lower()
+        if sub == "on":
+            self.routing_config.enabled = True
+            self.console.print("[green]Routing enabled.[/green]")
+        elif sub == "off":
+            self.routing_config.enabled = False
+            self.console.print(
+                "[yellow]Routing disabled. Pinned model used for every turn.[/yellow]")
+        elif sub in ("", "show", "status"):
+            self._print_routing_config()
+        else:
+            self.console.print("[red]/route expects: on, off, or show[/red]")
+
+    def _cmd_system(self, arg: str) -> None:
+        new_system = arg or None
+        self.store.update_system_prompt(self.state.session.id, new_system)
+        self.state.session.system_prompt = new_system
+        if new_system:
+            self.console.print("[green]System prompt set.[/green]")
+        else:
+            self.console.print("[green]System prompt cleared.[/green]")
+
+    def _cmd_title(self, arg: str) -> None:
+        if not arg:
+            self.console.print(
+                f"Current title: [cyan]{self.state.session.title}[/cyan]")
+            return
+        self.store.update_session_title(self.state.session.id, arg)
+        self.state.session.title = arg
+        self.console.print(f"[green]Title set to[/green] [cyan]{arg}[/cyan]")
+
+    def _cmd_clear(self) -> None:
+        new_sess = self.store.create_session(
+            model=self.state.session.current_model,
+            title="New chat",
+            system_prompt=self.state.session.system_prompt,
+        )
+        self.state.session = new_sess
+        self.state.approval = ApprovalState()  # fresh approvals per session
+        self.console.print(f"[green]New session[/green] [dim]{new_sess.id}[/dim]")
+        self._print_header()
+
+    def _cmd_history(self) -> None:
+        msgs = self.store.get_messages(self.state.session.id)
+        if not msgs:
+            self.console.print("[dim](no messages yet)[/dim]")
+            return
+        for m in msgs:
+            style = "cyan" if m.role == "user" else "green"
+            tag = m.role
+            if m.model:
+                tag += f" · {m.model}"
+            self.console.print(Rule(f"[{style}]{tag}[/{style}]"))
+            self.console.print(m.content)
+
+    def _cmd_tools(self) -> None:
+        tools = self.ext.mcp_manager.list_tools()
+        status = self.ext.mcp_manager.server_status()
+        if not status:
+            self.console.print(
+                "[dim]No MCP servers configured. Add an mcp.json under "
+                "~/.llmchat/ or .llmchat/ to expose tools.[/dim]")
+            return
+        for srv, st in status.items():
+            self.console.print(f"  [cyan]{srv}[/cyan]: {st}")
+        if tools:
+            self.console.print()
+            for t in tools:
+                desc = t.description.splitlines()[0] if t.description else ""
+                self.console.print(
+                    f"  [green]{t.fq_name}[/green]  [dim]{desc}[/dim]")
+
+    def _cmd_plugins(self) -> None:
+        sk = self.ext.skills.all()
+        cmds = list(self.ext.commands.values())
+        hk_total = sum(len(v) for v in self.ext.hooks.by_event.values())
+        self.console.print(
+            f"skills: [cyan]{len(sk)}[/cyan]   "
+            f"commands: [cyan]{len(cmds)}[/cyan]   "
+            f"hooks: [cyan]{hk_total}[/cyan]")
+        if sk:
+            self.console.print("\n[bold]skills[/bold]")
+            for s in sk:
+                trigger = ("always" if s.is_always_on() else
+                           f"triggers={s.triggers}" if s.triggers else
+                           f"patterns={s.file_patterns}")
+                self.console.print(
+                    f"  [cyan]{s.name}[/cyan]  [dim]{trigger}[/dim]")
+        if cmds:
+            self.console.print("\n[bold]commands[/bold]")
+            for c in cmds:
+                self.console.print(
+                    f"  [cyan]/{c.name}[/cyan]  [dim]{c.description}[/dim]")
+        if hk_total:
+            self.console.print("\n[bold]hooks[/bold]")
+            for event, hooks in self.ext.hooks.by_event.items():
+                for h in hooks:
+                    self.console.print(
+                        f"  [cyan]{event.value}[/cyan]: {' '.join(h.command)}")
+
+    # ----- the user turn ----------------------------------------------------
+
+    def _handle_user_turn(self, raw_text: str) -> None:
+        # 1. pre_user_message hooks.
+        hook_result = self.ext.hooks.dispatch(
+            HookEvent.PRE_USER_MESSAGE, raw_text)
+        if hook_result.blocked:
+            self.console.print(
+                f"[red]message blocked by hook:[/red] {hook_result.stderr.strip()}")
+            return
+        text = hook_result.transformed_payload or raw_text
+
+        # 2. Decide whether tools should be in play. We expose tools whenever
+        # any MCP server is connected. The router will then steer to a tools-
+        # capable tier.
+        tools = self.ext.mcp_manager.list_tools()
+        need_tools = bool(tools)
+
+        # 3. Pick a model.
+        try:
+            model, explanation = self._resolve_model_for_turn(text, need_tools)
+        except ValueError as e:
+            self.console.print(f"[red]{e}[/red]")
+            return
+
+        # 4. Persist the user message.
         self.store.add_message(self.state.session.id, "user", text, model=model)
 
+        # 5. Build system prompt: session prompt + active skills.
+        active_skills = self.ext.skills.select_for(text)
+        system_prompt = self._compose_system_prompt(active_skills)
+
+        # 6. Run the agentic loop (handles single-shot text or tool round-trips).
         provider_name, model_name = parse_model(model)
         try:
             provider = get_provider(provider_name)
@@ -262,39 +383,243 @@ class ChatLoop:
             self.console.print(f"[red]{e}[/red]")
             return
 
-        history = self.store.get_messages(self.state.session.id)
-        api_messages = [
-            ChatMessage(role=m.role, content=m.content)
-            for m in history
-            if m.role in ("user", "assistant")
-        ]
-
         self.console.print()
         if explanation:
             self.console.print(f"[dim]→ {model} · {explanation}[/dim]")
         else:
             self.console.print(f"[dim]assistant · {model}[/dim]")
 
-        chunks: list[str] = []
-        try:
-            for chunk in provider.stream(
-                model=model_name,
-                messages=api_messages,
-                system=self.state.session.system_prompt,
-            ):
-                chunks.append(chunk)
-                self.console.print(chunk, end="", soft_wrap=True, highlight=False)
-            self.console.print()
-        except ProviderError as e:
-            self.console.print(f"\n[red]Error: {e}[/red]")
-        except KeyboardInterrupt:
-            self.console.print("\n[yellow](interrupted)[/yellow]")
+        final_text = self._run_agentic_loop(
+            provider=provider, model_name=model_name, model_label=model,
+            system_prompt=system_prompt, tools=tools)
 
-        full = "".join(chunks)
-        if full:
-            self.store.add_message(
-                self.state.session.id, "assistant", full, model=model)
+        # 7. post_assistant_message hooks (informational only — we don't
+        # transform what we already showed the user).
+        if final_text:
+            self.ext.hooks.dispatch(
+                HookEvent.POST_ASSISTANT_MESSAGE, final_text)
+
         self.console.print()
+
+    def _compose_system_prompt(self, active_skills) -> str | None:
+        base = self.state.session.system_prompt or ""
+        addition = self.ext.skills.render_system_prompt_addition(active_skills)
+        combined = "\n\n".join(p for p in (base, addition) if p)
+        return combined or None
+
+    # ----- agentic loop -----------------------------------------------------
+
+    def _run_agentic_loop(self, provider, model_name: str, model_label: str,
+                          system_prompt: str | None, tools) -> str:
+        """Run one user turn, possibly across multiple model invocations
+        if the model requests tool calls. Returns the final assistant text
+        for use by post-message hooks."""
+        # Pull persisted history into our internal format. The loop adds
+        # to this list as the model responds.
+        api_messages: list[ChatMessage] = self._load_history_as_messages()
+
+        last_assistant_text = ""
+        for iteration in range(MAX_TOOL_ITERATIONS):
+            # Stream from the provider.
+            text_chunks: list[str] = []
+            tool_calls: list[ToolCall] = []
+            stop_reason: str | None = None
+
+            try:
+                stream = provider.stream(
+                    model=model_name,
+                    messages=api_messages,
+                    system=system_prompt,
+                    tools=tools if tools else None,
+                )
+                if not tools:
+                    # back-compat path: stream is just strings
+                    for chunk in stream:
+                        text_chunks.append(chunk)
+                        self.console.print(chunk, end="", soft_wrap=True,
+                                            highlight=False)
+                    self.console.print()
+                else:
+                    for ev in stream:
+                        if isinstance(ev, TextDelta):
+                            text_chunks.append(ev.text)
+                            self.console.print(ev.text, end="",
+                                                soft_wrap=True, highlight=False)
+                        elif isinstance(ev, ToolUseRequest):
+                            tool_calls = ev.calls
+                        elif isinstance(ev, TurnEnd):
+                            stop_reason = ev.stop_reason
+                    self.console.print()
+            except ProviderError as e:
+                self.console.print(f"\n[red]Error: {e}[/red]")
+                break
+            except KeyboardInterrupt:
+                self.console.print("\n[yellow](interrupted)[/yellow]")
+                break
+
+            assistant_text = "".join(text_chunks)
+            last_assistant_text = assistant_text
+
+            # Persist the assistant turn (with any tool_calls embedded so a
+            # future resume can re-run the conversation correctly).
+            if assistant_text or tool_calls:
+                self._store_assistant_turn(
+                    assistant_text, tool_calls, model_label)
+
+            # Update in-memory message list with the assistant's turn so it's
+            # included in the next iteration's request.
+            api_messages.append(ChatMessage(
+                role="assistant", content=assistant_text,
+                tool_calls=tool_calls or None))
+
+            if not tool_calls:
+                break  # done — model gave a text response with no tool requests
+
+            # Execute tool calls (with approval).
+            results = self._execute_tool_calls(tool_calls)
+            self._store_tool_results(results)
+            api_messages.append(ChatMessage(
+                role="tool", content="", tool_results=results))
+
+            # Continue the loop — model gets to see results and respond.
+        else:
+            self.console.print(
+                f"[yellow]Stopped after {MAX_TOOL_ITERATIONS} tool iterations. "
+                f"Send another message to continue.[/yellow]")
+
+        return last_assistant_text
+
+    def _load_history_as_messages(self) -> list[ChatMessage]:
+        """Reconstitute persisted messages into the format providers want.
+
+        Persisted messages may carry tool data in their ``content`` (we
+        store tool calls and results as JSON). We deserialize and rebuild
+        the ChatMessage with structured fields."""
+        import json
+        out: list[ChatMessage] = []
+        for m in self.store.get_messages(self.state.session.id):
+            if m.role == "user":
+                out.append(ChatMessage(role="user", content=m.content))
+            elif m.role == "assistant":
+                # Check for tool_calls metadata stored as a JSON suffix.
+                msg = ChatMessage(role="assistant", content=m.content)
+                tool_calls_meta = _extract_meta(m.content, "tool_calls")
+                if tool_calls_meta:
+                    msg.content = _strip_meta(m.content)
+                    msg.tool_calls = [
+                        ToolCall(id=c["id"], fq_name=c["fq_name"],
+                                  arguments=c.get("arguments") or {})
+                        for c in tool_calls_meta
+                    ]
+                out.append(msg)
+            elif m.role == "tool":
+                tool_results_meta = _extract_meta(m.content, "tool_results")
+                if tool_results_meta:
+                    out.append(ChatMessage(
+                        role="tool", content="",
+                        tool_results=[
+                            ToolResult(id=r["id"], fq_name=r["fq_name"],
+                                        content=r["content"],
+                                        is_error=r.get("is_error", False))
+                            for r in tool_results_meta
+                        ]))
+        return out
+
+    def _store_assistant_turn(self, text: str,
+                               tool_calls: list[ToolCall],
+                               model_label: str) -> None:
+        # Persist as a single assistant message. If there are tool calls,
+        # we attach them as a JSON-encoded metadata block at the end of the
+        # content so we can reconstruct on resume without changing the
+        # storage schema.
+        content = text
+        if tool_calls:
+            content = _attach_meta(content, "tool_calls", [
+                {"id": c.id, "fq_name": c.fq_name, "arguments": c.arguments}
+                for c in tool_calls
+            ])
+        self.store.add_message(
+            self.state.session.id, "assistant", content, model=model_label)
+
+    def _store_tool_results(self, results: list[ToolResult]) -> None:
+        if not results:
+            return
+        content = _attach_meta("", "tool_results", [
+            {"id": r.id, "fq_name": r.fq_name,
+             "content": r.content, "is_error": r.is_error}
+            for r in results
+        ])
+        self.store.add_message(self.state.session.id, "tool", content)
+
+    def _execute_tool_calls(self, calls: list[ToolCall]) -> list[ToolResult]:
+        results: list[ToolResult] = []
+        for call in calls:
+            # Approval gate.
+            if not self.state.approval.is_approved(call.fq_name):
+                decision = self._prompt_for_approval(call)
+                self.state.approval.record(call.fq_name, decision)
+                if decision == ApprovalDecision.DENY:
+                    results.append(ToolResult(
+                        id=call.id, fq_name=call.fq_name,
+                        content="user denied tool call", is_error=True))
+                    continue
+
+            # Pre-tool-call hook.
+            import json
+            hook_payload = json.dumps({
+                "tool": call.fq_name, "arguments": call.arguments})
+            hook_res = self.ext.hooks.dispatch(
+                HookEvent.PRE_TOOL_CALL, hook_payload)
+            if hook_res.blocked:
+                results.append(ToolResult(
+                    id=call.id, fq_name=call.fq_name,
+                    content=f"hook blocked tool: {hook_res.stderr.strip()}",
+                    is_error=True))
+                continue
+
+            self.console.print(
+                f"[dim]→ tool: [cyan]{call.fq_name}[/cyan] "
+                f"args={_short_args(call.arguments)}[/dim]")
+
+            result = self.ext.mcp_manager.call_tool(
+                call.fq_name, call.arguments)
+            # Stamp the call id onto the result so providers can correlate.
+            result = ToolResult(
+                id=call.id, fq_name=call.fq_name,
+                content=result.content, is_error=result.is_error)
+            results.append(result)
+
+            self.ext.hooks.dispatch(
+                HookEvent.POST_TOOL_CALL,
+                json.dumps({"tool": call.fq_name,
+                             "result": result.content,
+                             "is_error": result.is_error}))
+
+            # Show a short preview.
+            preview = result.content[:200].replace("\n", " ")
+            color = "red" if result.is_error else "dim"
+            self.console.print(f"[{color}]   {preview}[/{color}]")
+
+        return results
+
+    def _prompt_for_approval(self, call: ToolCall) -> ApprovalDecision:
+        if self.state.approval.auto_approve_all:
+            return ApprovalDecision.APPROVE_SESSION
+        self.console.print(Panel(
+            f"[bold]{call.fq_name}[/bold]\n"
+            f"args: {_short_args(call.arguments, max_len=400)}",
+            title="Tool call requested",
+            border_style="yellow"))
+        try:
+            answer = self.prompt_session.prompt(
+                "Allow? [y/Y/n] (y=once, Y=session, n=deny) > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return ApprovalDecision.DENY
+        if answer == "Y":
+            return ApprovalDecision.APPROVE_SESSION
+        if answer.lower() == "y":
+            return ApprovalDecision.APPROVE_ONCE
+        return ApprovalDecision.DENY
 
     # ----- presentation -----------------------------------------------------
 
@@ -322,6 +647,20 @@ class ChatLoop:
         else:
             self.console.print(
                 f"model: [cyan]{s.current_model}[/cyan] [dim](routing off)[/dim]")
+        # MCP/extensions summary.
+        ext_summary = []
+        sk_count = len(self.ext.skills.all())
+        cmd_count = len(self.ext.commands)
+        tool_count = len(self.ext.mcp_manager.list_tools())
+        if sk_count:
+            ext_summary.append(f"{sk_count} skill(s)")
+        if cmd_count:
+            ext_summary.append(f"{cmd_count} command(s)")
+        if tool_count:
+            ext_summary.append(f"{tool_count} tool(s)")
+        if ext_summary:
+            self.console.print(
+                f"[dim]extensions: {', '.join(ext_summary)} — /plugins for details[/dim]")
         self.console.print("[dim]/help for commands, /exit to quit[/dim]")
         if s.system_prompt:
             self.console.print(f"[dim]system: {s.system_prompt[:80]}...[/dim]")
@@ -343,16 +682,73 @@ class ChatLoop:
             if not tier or not tier.model:
                 self.console.print(f"  [dim]{tier_name}: (not configured)[/dim]")
                 continue
+            tools_tag = "" if tier.supports_tools else " [dim](no tools)[/dim]"
             self.console.print(
                 f"  [cyan]{tier_name}[/cyan]: {tier.model} "
-                f"[dim](≤ {tier.max_input_chars} chars)[/dim]")
+                f"[dim](≤ {tier.max_input_chars} chars)[/dim]{tools_tag}")
 
 
 def run_chat(store: Store, session: Session,
              routing_config: RoutingConfig,
+             extensions: ExtensionsBundle,
              pinned_model: str | None = None) -> None:
-    loop = ChatLoop(store=store, session=session,
-                    routing_config=routing_config)
-    if pinned_model:
-        loop.set_pinned_model(pinned_model)
-    loop.run()
+    extensions.mcp_manager.start()
+    try:
+        loop = ChatLoop(store=store, session=session,
+                        routing_config=routing_config,
+                        extensions=extensions)
+        if pinned_model:
+            loop.set_pinned_model(pinned_model)
+        loop.run()
+    finally:
+        extensions.mcp_manager.stop()
+
+
+# ----- helpers --------------------------------------------------------------
+
+# Tool-call/result metadata is appended to message content as a JSON-encoded
+# block delimited by a sentinel. This keeps the SQLite schema unchanged while
+# still letting us reconstruct structured tool data on resume.
+_META_PREFIX = "\n\n<!--llmchat:"
+_META_SUFFIX = "-->"
+
+
+def _attach_meta(content: str, key: str, value) -> str:
+    import json
+    return content + _META_PREFIX + key + ":" + json.dumps(value) + _META_SUFFIX
+
+
+def _extract_meta(content: str, key: str):
+    """Return parsed metadata for ``key``, or None if not present."""
+    import json
+    needle = _META_PREFIX + key + ":"
+    idx = content.find(needle)
+    if idx < 0:
+        return None
+    end = content.find(_META_SUFFIX, idx)
+    if end < 0:
+        return None
+    payload = content[idx + len(needle):end]
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+
+def _strip_meta(content: str) -> str:
+    """Remove all metadata blocks for display purposes."""
+    out = content
+    while True:
+        idx = out.find(_META_PREFIX)
+        if idx < 0:
+            return out.rstrip()
+        end = out.find(_META_SUFFIX, idx)
+        if end < 0:
+            return out.rstrip()
+        out = out[:idx] + out[end + len(_META_SUFFIX):]
+
+
+def _short_args(args: dict, max_len: int = 80) -> str:
+    import json
+    s = json.dumps(args, separators=(",", ":"), ensure_ascii=False)
+    return s if len(s) <= max_len else s[:max_len] + "..."
