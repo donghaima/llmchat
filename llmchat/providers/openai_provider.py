@@ -15,7 +15,7 @@ from typing import Iterator
 
 from ..mcp.types import (
     StreamEvent, TextDelta, ToolCall, ToolDescriptor,
-    ToolUseRequest, TurnEnd,
+    ToolUseRequest, TurnEnd, Usage,
 )
 from .base import ChatMessage, Provider, ProviderError, RateLimitError
 
@@ -80,8 +80,12 @@ class OpenAIProvider(Provider):
                 api_messages.append({"role": m.role, "content": m.content})
         try:
             stream = client.chat.completions.create(
-                model=model, messages=api_messages, stream=True)
+                model=model, messages=api_messages, stream=True,
+                stream_options={"include_usage": True})
             for chunk in stream:
+                usage = _usage_from_chunk(chunk)
+                if usage is not None:
+                    yield usage
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -107,6 +111,7 @@ class OpenAIProvider(Provider):
                 messages=api_messages,
                 tools=api_tools,
                 stream=True,
+                stream_options={"include_usage": True},
             )
         except Exception as e:
             if getattr(e, "status_code", None) == 429:
@@ -119,9 +124,13 @@ class OpenAIProvider(Provider):
         # Each tool call is identified by an ``index`` field.
         tool_calls_acc: dict[int, dict] = {}
         finish_reason: str | None = None
+        usage: Usage | None = None
 
         try:
             for chunk in stream:
+                u = _usage_from_chunk(chunk)
+                if u is not None:
+                    usage = u
                 if not chunk.choices:
                     continue
                 choice = chunk.choices[0]
@@ -162,6 +171,8 @@ class OpenAIProvider(Provider):
                 calls.append(ToolCall(
                     id=acc["id"], fq_name=acc["name"], arguments=arguments))
             yield ToolUseRequest(calls=calls)
+        if usage is not None:
+            yield usage
         yield TurnEnd(stop_reason=finish_reason)
 
     # ----- message translation ---------------------------------------------
@@ -230,3 +241,14 @@ class OpenAIProvider(Provider):
             return sorted(ids) if ids else list(_KNOWN_MODELS)
         except Exception:
             return list(_KNOWN_MODELS)
+
+
+def _usage_from_chunk(chunk) -> Usage | None:
+    """Read usage off the terminal chunk (present when include_usage is set)."""
+    u = getattr(chunk, "usage", None)
+    if u is None:
+        return None
+    return Usage(
+        input_tokens=getattr(u, "prompt_tokens", 0) or 0,
+        output_tokens=getattr(u, "completion_tokens", 0) or 0,
+    )

@@ -20,7 +20,7 @@ from typing import Iterator
 
 from ..mcp.types import (
     StreamEvent, TextDelta, ToolCall, ToolDescriptor,
-    ToolUseRequest, TurnEnd,
+    ToolUseRequest, TurnEnd, Usage,
 )
 from .base import ChatMessage, Provider, ProviderError, RateLimitError
 
@@ -84,13 +84,20 @@ class GoogleProvider(Provider):
         config = None
         if system:
             config = types.GenerateContentConfig(system_instruction=system)
+        last_usage = None
         try:
             stream = client.models.generate_content_stream(
                 model=model, contents=contents, config=config)
             for chunk in stream:
+                um = getattr(chunk, "usage_metadata", None)
+                if um is not None:
+                    last_usage = um
                 text = getattr(chunk, "text", None)
                 if text:
                     yield text
+            usage = _usage_from_metadata(last_usage)
+            if usage is not None:
+                yield usage
         except Exception as e:
             if (getattr(e, "status_code", None) == 429
                     or type(e).__name__ == "ResourceExhausted"):
@@ -115,10 +122,14 @@ class GoogleProvider(Provider):
 
         finish_reason: str | None = None
         captured_calls: list[ToolCall] = []
+        last_usage = None
         try:
             stream = client.models.generate_content_stream(
                 model=model, contents=contents, config=config)
             for chunk in stream:
+                um = getattr(chunk, "usage_metadata", None)
+                if um is not None:
+                    last_usage = um
                 # text deltas
                 text = getattr(chunk, "text", None)
                 if text:
@@ -147,6 +158,9 @@ class GoogleProvider(Provider):
 
         if captured_calls:
             yield ToolUseRequest(calls=captured_calls)
+        usage = _usage_from_metadata(last_usage)
+        if usage is not None:
+            yield usage
         yield TurnEnd(stop_reason=finish_reason)
 
     # ----- message translation ---------------------------------------------
@@ -218,3 +232,12 @@ class GoogleProvider(Provider):
             return sorted(set(ids)) if ids else list(_KNOWN_MODELS)
         except Exception:
             return list(_KNOWN_MODELS)
+
+
+def _usage_from_metadata(um) -> Usage | None:
+    if um is None:
+        return None
+    return Usage(
+        input_tokens=getattr(um, "prompt_token_count", 0) or 0,
+        output_tokens=getattr(um, "candidates_token_count", 0) or 0,
+    )

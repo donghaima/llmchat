@@ -19,6 +19,7 @@ from typing import Iterator
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from ..mcp.types import Usage
 from .base import ChatMessage, Provider, ProviderError
 
 
@@ -72,6 +73,10 @@ class OllamaProvider(Provider):
                     except json.JSONDecodeError:
                         continue
                     if obj.get("done"):
+                        yield Usage(
+                            input_tokens=obj.get("prompt_eval_count", 0) or 0,
+                            output_tokens=obj.get("eval_count", 0) or 0,
+                        )
                         break
                     msg = obj.get("message") or {}
                     text = msg.get("content")

@@ -12,6 +12,12 @@ When tools ARE passed, providers yield ``StreamEvent`` objects from
 ``ToolUseRequest`` for tool invocations, ``TurnEnd`` to signal completion.
 The chat loop's tool-calling path consumes these events.
 
+Token usage is reported via a ``Usage`` object that may appear on EITHER path:
+the text-only path yields it as a single trailing item after its ``str``
+chunks, and the tool path emits it alongside ``TurnEnd``. Consumers of the
+plain-string path must tolerate this one non-``str`` trailer. A provider that
+can't report counts simply omits it, and the caller falls back to an estimate.
+
 We also accept ``tool_results`` — a list of results from prior tool calls in
 the same agentic turn — so the provider can stitch them into the conversation
 in whatever format it requires.
@@ -67,7 +73,8 @@ class Provider(ABC):
                ) -> Iterator[str | StreamEvent]:
         """Yield text chunks (or stream events when tools are involved).
 
-        - If ``tools`` is None or empty: yields ``str`` chunks (back-compat).
+        - If ``tools`` is None or empty: yields ``str`` chunks (back-compat),
+          optionally followed by a single trailing ``Usage``.
         - If ``tools`` is non-empty: yields ``StreamEvent`` objects.
 
         Tool conversation state (the assistant's prior tool_use blocks and

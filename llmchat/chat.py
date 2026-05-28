@@ -29,10 +29,11 @@ from .extensions import (
 )
 from .mcp import ApprovalState, MCPManager, ToolCall, ToolResult
 from .mcp.approval import ApprovalDecision
-from .mcp.types import StreamEvent, TextDelta, ToolUseRequest, TurnEnd
+from .mcp.types import StreamEvent, TextDelta, ToolUseRequest, TurnEnd, Usage
 from .providers import (
     ChatMessage, ProviderError, RateLimitError, get_provider, parse_model,
 )
+from . import pricing
 from .routing import Router, RoutingConfig
 from .storage import Session, Store
 
@@ -490,6 +491,7 @@ class ChatLoop:
 
         api_messages = self._load_history_as_messages()
         results: dict[str, str] = {}
+        usages: dict[str, Usage | None] = {}
         errors: dict[str, str] = {}
         lock = threading.Lock()
 
@@ -502,18 +504,22 @@ class ChatLoop:
                     errors[model_label] = str(e)
                 return
             chunks: list[str] = []
+            usage: Usage | None = None
             try:
                 for chunk in provider.stream(
                         model=model_name, messages=api_messages,
                         system=system_prompt, tools=None):
                     if isinstance(chunk, str):
                         chunks.append(chunk)
+                    elif isinstance(chunk, Usage):
+                        usage = chunk
             except ProviderError as e:
                 with lock:
                     errors[model_label] = str(e)
                 return
             with lock:
                 results[model_label] = "".join(chunks)
+                usages[model_label] = usage
 
         self.console.print(
             f"[dim]Querying {len(models)} models in parallel…[/dim]")
@@ -531,11 +537,19 @@ class ChatLoop:
                     title=f"[red]{model_label} — error[/red]",
                     border_style="red"))
             elif model_label in results:
+                usage = usages.get(model_label) or self._estimate_usage(
+                    system_prompt, api_messages, results[model_label])
+                cost = pricing.cost_for(model_label, usage)
+                subtitle = self._format_tokens_cost(
+                    usage.input_tokens, usage.output_tokens, cost,
+                    usage.is_estimate)
                 self.console.print(Panel(
                     results[model_label],
                     title=f"[cyan]{model_label}[/cyan]",
+                    subtitle=f"[dim]{subtitle}[/dim]",
                     border_style="cyan"))
-                self._store_assistant_turn(results[model_label], [], model_label)
+                self._store_assistant_turn(
+                    results[model_label], [], model_label, usage)
 
     # ----- agentic loop -----------------------------------------------------
 
@@ -549,11 +563,13 @@ class ChatLoop:
         api_messages: list[ChatMessage] = self._load_history_as_messages()
 
         last_assistant_text = ""
+        turn_usage = Usage()
         for iteration in range(MAX_TOOL_ITERATIONS):
             # Stream from the provider.
             text_chunks: list[str] = []
             tool_calls: list[ToolCall] = []
             stop_reason: str | None = None
+            captured_usage: Usage | None = None
 
             try:
                 stream = provider.stream(
@@ -563,8 +579,12 @@ class ChatLoop:
                     tools=tools if tools else None,
                 )
                 if not tools:
-                    # back-compat path: stream is just strings
+                    # back-compat path: stream is strings, plus an optional
+                    # trailing Usage object we route to accounting, not display.
                     for chunk in stream:
+                        if isinstance(chunk, Usage):
+                            captured_usage = chunk
+                            continue
                         text_chunks.append(chunk)
                         self.console.print(chunk, end="", soft_wrap=True,
                                             highlight=False)
@@ -577,6 +597,8 @@ class ChatLoop:
                                                 soft_wrap=True, highlight=False)
                         elif isinstance(ev, ToolUseRequest):
                             tool_calls = ev.calls
+                        elif isinstance(ev, Usage):
+                            captured_usage = ev
                         elif isinstance(ev, TurnEnd):
                             stop_reason = ev.stop_reason
                     self.console.print()
@@ -593,10 +615,18 @@ class ChatLoop:
             last_assistant_text = assistant_text
 
             # Persist the assistant turn (with any tool_calls embedded so a
-            # future resume can re-run the conversation correctly).
+            # future resume can re-run the conversation correctly). Token usage
+            # is attached too — counted from the provider when reported, or
+            # estimated from the request/response text as a fallback.
             if assistant_text or tool_calls:
+                iter_usage = captured_usage or self._estimate_usage(
+                    system_prompt, api_messages, assistant_text)
                 self._store_assistant_turn(
-                    assistant_text, tool_calls, model_label)
+                    assistant_text, tool_calls, model_label, iter_usage)
+                turn_usage.input_tokens += iter_usage.input_tokens
+                turn_usage.output_tokens += iter_usage.output_tokens
+                turn_usage.is_estimate = (
+                    turn_usage.is_estimate or iter_usage.is_estimate)
 
             # Update in-memory message list with the assistant's turn so it's
             # included in the next iteration's request.
@@ -619,6 +649,7 @@ class ChatLoop:
                 f"[yellow]Stopped after {MAX_TOOL_ITERATIONS} tool iterations. "
                 f"Send another message to continue.[/yellow]")
 
+        self._print_turn_usage(turn_usage, model_label)
         return last_assistant_text
 
     def _load_history_as_messages(self) -> list[ChatMessage]:
@@ -633,11 +664,11 @@ class ChatLoop:
             if m.role == "user":
                 out.append(ChatMessage(role="user", content=m.content))
             elif m.role == "assistant":
-                # Check for tool_calls metadata stored as a JSON suffix.
-                msg = ChatMessage(role="assistant", content=m.content)
+                # Always strip metadata blocks (tool_calls, usage, ...) so they
+                # never leak back into the provider request as message text.
+                msg = ChatMessage(role="assistant", content=_strip_meta(m.content))
                 tool_calls_meta = _extract_meta(m.content, "tool_calls")
                 if tool_calls_meta:
-                    msg.content = _strip_meta(m.content)
                     msg.tool_calls = [
                         ToolCall(id=c["id"], fq_name=c["fq_name"],
                                   arguments=c.get("arguments") or {})
@@ -659,17 +690,26 @@ class ChatLoop:
 
     def _store_assistant_turn(self, text: str,
                                tool_calls: list[ToolCall],
-                               model_label: str) -> None:
+                               model_label: str,
+                               usage: Usage | None = None) -> None:
         # Persist as a single assistant message. If there are tool calls,
         # we attach them as a JSON-encoded metadata block at the end of the
         # content so we can reconstruct on resume without changing the
-        # storage schema.
+        # storage schema. Token usage rides along in the same way.
         content = text
         if tool_calls:
             content = _attach_meta(content, "tool_calls", [
                 {"id": c.id, "fq_name": c.fq_name, "arguments": c.arguments}
                 for c in tool_calls
             ])
+        if usage is not None:
+            content = _attach_meta(content, "usage", {
+                "input": usage.input_tokens,
+                "output": usage.output_tokens,
+                "cost": pricing.cost_for(model_label, usage),
+                "estimate": usage.is_estimate,
+                "model": model_label,
+            })
         self.store.add_message(
             self.state.session.id, "assistant", content, model=model_label)
 
@@ -682,6 +722,67 @@ class ChatLoop:
             for r in results
         ])
         self.store.add_message(self.state.session.id, "tool", content)
+
+    # ----- token usage / cost -----------------------------------------------
+
+    def _estimate_usage(self, system_prompt: str | None,
+                        api_messages: list[ChatMessage],
+                        assistant_text: str) -> Usage:
+        """Fallback usage when a provider reports no token counts."""
+        in_est = pricing.estimate_tokens(system_prompt or "")
+        in_est += sum(pricing.estimate_tokens(m.content) for m in api_messages)
+        return Usage(input_tokens=in_est,
+                     output_tokens=pricing.estimate_tokens(assistant_text),
+                     is_estimate=True)
+
+    def _session_usage_total(self) -> tuple[int, int, float | None, bool]:
+        """Sum token counts and cost across this session's assistant turns.
+
+        Returns (input, output, cost_or_None, is_estimate). Cost is None only
+        when no message carried a known price."""
+        total_in = total_out = 0
+        total_cost = 0.0
+        cost_known = False
+        is_estimate = False
+        for m in self.store.get_messages(self.state.session.id):
+            if m.role != "assistant":
+                continue
+            meta = _extract_meta(m.content, "usage")
+            if not meta:
+                continue
+            total_in += meta.get("input", 0) or 0
+            total_out += meta.get("output", 0) or 0
+            c = meta.get("cost")
+            if c is not None:
+                total_cost += c
+                cost_known = True
+            if meta.get("estimate"):
+                is_estimate = True
+        return total_in, total_out, (total_cost if cost_known else None), is_estimate
+
+    @staticmethod
+    def _format_tokens_cost(inp: int, out: int, cost: float | None,
+                            is_estimate: bool = False) -> str:
+        approx = "~" if is_estimate else ""
+        if cost is None:
+            money = "cost n/a"
+        elif cost == 0:
+            money = "free"
+        else:
+            money = f"${cost:.4f}"
+        return f"{approx}{inp:,} in · {approx}{out:,} out · {money}"
+
+    def _print_turn_usage(self, turn_usage: Usage, model_label: str) -> None:
+        if not (turn_usage.input_tokens or turn_usage.output_tokens):
+            return
+        cost = pricing.cost_for(model_label, turn_usage)
+        line = self._format_tokens_cost(
+            turn_usage.input_tokens, turn_usage.output_tokens, cost,
+            turn_usage.is_estimate)
+        self.console.print(f"[dim]↳ {line}[/dim]")
+        ti, to, tc, est = self._session_usage_total()
+        sess = self._format_tokens_cost(ti, to, tc, est)
+        self.console.print(f"[dim]   session total: {sess}[/dim]")
 
     def _execute_tool_calls(self, calls: list[ToolCall]) -> list[ToolResult]:
         results: list[ToolResult] = []
@@ -801,6 +902,10 @@ class ChatLoop:
             self.console.print(
                 f"[dim]({len(msgs)} message(s) in history — "
                 f"continuing where you left off)[/dim]")
+            ti, to, tc, est = self._session_usage_total()
+            if ti or to:
+                sess = self._format_tokens_cost(ti, to, tc, est)
+                self.console.print(f"[dim]session total: {sess}[/dim]")
         self.console.print()
 
     def _print_routing_config(self) -> None:

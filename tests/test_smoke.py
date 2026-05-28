@@ -37,17 +37,43 @@ class FakeProvider(Provider):
         last = next((m.content for m in reversed(messages) if m.role == "user"),
                     "(nothing)")
         if tools:
-            from llmchat.mcp.types import TextDelta, TurnEnd
+            from llmchat.mcp.types import TextDelta, TurnEnd, Usage
             yield TextDelta(f"[{model}] ")
             yield TextDelta("you said: ")
             yield TextDelta(last)
+            yield Usage(input_tokens=10, output_tokens=5)
             yield TurnEnd(stop_reason="end_turn")
         else:
+            from llmchat.mcp.types import Usage
             for part in (f"[{model}] ", "you said: ", last):
                 yield part
+            yield Usage(input_tokens=10, output_tokens=5)
 
     def list_models(self):
         return ["fake-small", "fake-large"]
+
+
+# A provider that never reports token usage — exercises the estimate fallback.
+class FakeNoUsageProvider(Provider):
+    name = "fake_nousage"
+
+    def is_configured(self) -> bool:
+        return True
+
+    def list_models(self):
+        return ["fake-nousage"]
+
+    def stream(self, model, messages, system=None, tools=None):
+        last = next((m.content for m in reversed(messages) if m.role == "user"),
+                    "(nothing)")
+        if tools:
+            from llmchat.mcp.types import TextDelta, TurnEnd
+            yield TextDelta(f"[{model}] ")
+            yield TextDelta(last)
+            yield TurnEnd(stop_reason="end_turn")
+        else:
+            for part in (f"[{model}] ", last):
+                yield part
 
 
 # A provider that emits one round of tool calls, then a text response.
@@ -64,13 +90,15 @@ class FakeToolProvider(Provider):
         return ["fake-tool-model"]
 
     def stream(self, model, messages, system=None, tools=None):
-        from llmchat.mcp.types import TextDelta, ToolCall, ToolUseRequest, TurnEnd
+        from llmchat.mcp.types import (
+            TextDelta, ToolCall, ToolUseRequest, TurnEnd, Usage)
         # Detect if we already have tool results in the history.
         has_results = any(
             getattr(m, "tool_results", None) for m in messages
         )
         if has_results:
             yield TextDelta(f"[{model}] done with tools")
+            yield Usage(input_tokens=20, output_tokens=8)
             yield TurnEnd(stop_reason="end_turn")
         else:
             yield TextDelta(f"[{model}] ")
@@ -78,6 +106,7 @@ class FakeToolProvider(Provider):
                 ToolCall(id="tc001", fq_name="test_srv::echo",
                          arguments={"msg": "hello"})
             ])
+            yield Usage(input_tokens=15, output_tokens=3)
             yield TurnEnd(stop_reason="tool_use")
 
 
@@ -119,6 +148,7 @@ import llmchat.providers as registry  # noqa: E402
 _original_get = registry.get_provider
 _fake_instance = FakeProvider()
 _fake_tool_instance = FakeToolProvider()
+_fake_nousage_instance = FakeNoUsageProvider()
 
 
 def _patched_get(name: str):
@@ -126,6 +156,8 @@ def _patched_get(name: str):
         return _fake_instance
     if name == "fake_tool":
         return _fake_tool_instance
+    if name == "fake_nousage":
+        return _fake_nousage_instance
     return _original_get(name)
 
 
@@ -545,6 +577,97 @@ def test_router_code_with_complexity_to_flagship():
     print("  router: complex code -> flagship OK")
 
 
+# ----- token usage / cost ---------------------------------------------------
+
+def test_cost_for():
+    from llmchat.mcp.types import Usage
+    from llmchat.pricing import cost_for, estimate_tokens
+
+    u = Usage(input_tokens=1_000_000, output_tokens=1_000_000)
+    # Local models are always free.
+    assert cost_for("ollama:llama3.2", u) == 0.0
+    # A known paid model returns the table math: $1/Mtok in + $5/Mtok out.
+    c = cost_for("anthropic:claude-haiku-4-5", u)
+    assert c is not None and abs(c - 6.0) < 1e-9, c
+    # Unknown models return None (no guessing).
+    assert cost_for("madeup:model-x", u) is None
+    # Estimator basics.
+    assert estimate_tokens("") == 0
+    assert estimate_tokens("abcd") == 1
+    print("  pricing.cost_for + estimate_tokens OK")
+
+
+def test_usage_persisted():
+    from llmchat.chat import ChatLoop, _extract_meta, _strip_meta
+    from rich.console import Console
+
+    store = Store()
+    sess = store.create_session(model="fake:fake-small", title="t")
+    cfg = _fake_routing_config()
+    loop = ChatLoop(store=store, session=sess, routing_config=cfg,
+                    extensions=_empty_bundle(),
+                    console=Console(file=open(os.devnull, "w")))
+
+    loop._handle_user_turn("what is 2 + 2?")
+    asst = [m for m in store.get_messages(sess.id) if m.role == "assistant"][-1]
+    meta = _extract_meta(asst.content, "usage")
+    assert meta is not None, "usage metadata should be attached"
+    assert meta["input"] == 10 and meta["output"] == 5, meta
+    assert meta["estimate"] is False
+    # Fake models aren't in the price table, so cost is unknown (None).
+    assert meta["cost"] is None
+    # The metadata must not leak into the displayable content.
+    assert "llmchat:usage" not in _strip_meta(asst.content)
+    print("  usage persisted in assistant message OK")
+
+
+def test_session_usage_total():
+    from llmchat.chat import ChatLoop
+    from rich.console import Console
+
+    store = Store()
+    sess = store.create_session(model="fake:fake-small", title="t")
+    cfg = _fake_routing_config()
+    loop = ChatLoop(store=store, session=sess, routing_config=cfg,
+                    extensions=_empty_bundle(),
+                    console=Console(file=open(os.devnull, "w")))
+
+    loop._handle_user_turn("what is 2 + 2?")
+    loop._handle_user_turn("what is 3 + 3?")
+    ti, to, tc, est = loop._session_usage_total()
+    assert ti == 20 and to == 10, (ti, to)  # two turns x (10 in, 5 out)
+    assert tc is None  # fake models are unpriced
+    assert est is False
+    print("  session usage total OK")
+
+
+def test_estimate_fallback():
+    from llmchat.chat import ChatLoop, _extract_meta
+    from llmchat.routing import RoutingConfig, Tier
+    from rich.console import Console
+
+    store = Store()
+    sess = store.create_session(model="fake_nousage:m", title="t")
+    cfg = RoutingConfig(
+        tiers={
+            "local": Tier("local", "fake_nousage:m", 4_000),
+            "cheap": Tier("cheap", "fake_nousage:m", 20_000),
+            "flagship": Tier("flagship", "fake_nousage:m", 200_000),
+        },
+        default_tier="cheap", enabled=True, explain=False)
+    loop = ChatLoop(store=store, session=sess, routing_config=cfg,
+                    extensions=_empty_bundle(),
+                    console=Console(file=open(os.devnull, "w")))
+
+    loop._handle_user_turn("Tell me about React hooks.")
+    asst = [m for m in store.get_messages(sess.id) if m.role == "assistant"][-1]
+    meta = _extract_meta(asst.content, "usage")
+    assert meta is not None
+    assert meta["estimate"] is True, "no provider usage -> should be estimated"
+    assert meta["input"] > 0 and meta["output"] > 0, meta
+    print("  estimate fallback OK")
+
+
 # ----- CLI ------------------------------------------------------------------
 
 def test_cli_route_test_command():
@@ -630,6 +753,12 @@ if __name__ == "__main__":
     test_slash_command_expansion()
     test_tool_approval_deny()
     test_tool_approval_session()
+    print()
+    print("token usage / cost:")
+    test_cost_for()
+    test_usage_persisted()
+    test_session_usage_total()
+    test_estimate_fallback()
     print()
     print("CLI:")
     test_cli_route_test_command()

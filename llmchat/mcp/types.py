@@ -69,4 +69,20 @@ class TurnEnd:
     stop_reason: str | None = None
 
 
-StreamEvent = TextDelta | ToolUseRequest | TurnEnd
+@dataclass
+class Usage:
+    """Token counts for one model invocation.
+
+    Unlike the other events, ``Usage`` is yielded on BOTH stream paths: the
+    tool path emits it alongside ``TurnEnd``, and the text-only ``str`` path
+    emits it as a trailing item after the text chunks. Consumers of the
+    plain-string path must therefore tolerate a single non-``str`` trailer
+    (see ``Provider.stream``). ``is_estimate`` is set when the provider
+    couldn't report real counts and the caller derived them heuristically.
+    """
+    input_tokens: int = 0
+    output_tokens: int = 0
+    is_estimate: bool = False
+
+
+StreamEvent = TextDelta | ToolUseRequest | TurnEnd | Usage

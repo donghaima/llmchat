@@ -23,7 +23,7 @@ from typing import Iterator
 
 from ..mcp.types import (
     StreamEvent, TextDelta, ToolCall, ToolDescriptor,
-    ToolUseRequest, TurnEnd,
+    ToolUseRequest, TurnEnd, Usage,
 )
 from .base import ChatMessage, Provider, ProviderError, RateLimitError
 
@@ -91,6 +91,9 @@ class AnthropicProvider(Provider):
             with client.messages.stream(**kwargs) as stream:
                 for text in stream.text_stream:
                     yield text
+                usage = _usage_from(stream.get_final_message())
+                if usage is not None:
+                    yield usage
         except Exception as e:
             if getattr(e, "status_code", None) == 429:
                 raise RateLimitError(f"Anthropic rate limit: {e}") from e
@@ -136,6 +139,9 @@ class AnthropicProvider(Provider):
                         ))
                 if tool_uses:
                     yield ToolUseRequest(calls=tool_uses)
+                usage = _usage_from(final)
+                if usage is not None:
+                    yield usage
                 yield TurnEnd(stop_reason=getattr(final, "stop_reason", None))
         except Exception as e:
             if getattr(e, "status_code", None) == 429:
@@ -209,3 +215,13 @@ class AnthropicProvider(Provider):
             return ids or list(_KNOWN_MODELS)
         except Exception:
             return list(_KNOWN_MODELS)
+
+
+def _usage_from(final) -> Usage | None:
+    u = getattr(final, "usage", None)
+    if u is None:
+        return None
+    return Usage(
+        input_tokens=getattr(u, "input_tokens", 0) or 0,
+        output_tokens=getattr(u, "output_tokens", 0) or 0,
+    )
