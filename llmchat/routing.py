@@ -10,6 +10,15 @@ Why heuristic-first, not a classifier?
     to detect with regex and length checks; the ambiguous 20% goes to
     the configured default tier, which is a deliberate choice.
 
+    That reasoning holds for chat completions, which bill output tokens
+    and take seconds. It does not hold for a System One judgment, which
+    returns a typed answer, bills nothing for output, and costs about
+    $0.00006 a turn. So the ambiguous 20% has a second option now: set
+    ``[semantic] enabled = true`` and :mod:`llmchat.semantic_routing`
+    answers the questions regex cannot, while everything deterministic —
+    length limits, tier availability, tool support — stays right here.
+    With it off, or unreachable, this module behaves exactly as before.
+
 Tiers (by convention):
     "local"     — runs on your machine, free, smaller. Good for short
                   factual Q&A, simple rephrasing, basic completion.
@@ -85,11 +94,46 @@ class Tier:
 
 
 @dataclass
+class SemanticConfig:
+    """Settings for the optional System One judge.
+
+    The thresholds are policy, deliberately kept out of the judge itself:
+    changing one re-reads signals the model already produced rather than
+    asking it anything new.
+    """
+    enabled: bool = False        # off until the user opts in
+    model: str | None = None     # None → the SDK default (jev-latest)
+    timeout_seconds: float = 3.0
+
+    # Bands on the 0–2 difficulty scale. Between them lies "cheap".
+    local_at: float = 0.6        # at or below this → local
+    flagship_at: float = 1.5     # at or above this → flagship
+
+    # A split distribution means the cheap answer might be the wrong one,
+    # and the downside is lopsided: a needless flagship turn costs cents,
+    # a botched local one costs the user another round trip. So low
+    # confidence escalates one tier rather than trusting the midpoint.
+    min_confidence: float = 0.5
+
+    # Local models lose the thread across turns and reason poorly about
+    # program behavior, so either signal lifts a local pick to cheap.
+    context_threshold: float = 0.7
+    code_threshold: float = 0.7
+
+    # Off by default: it lets a turn reach a tier that cannot call tools.
+    # Turn it on to stop MCP being configured from pinning every single
+    # turn above the local tier.
+    trust_tool_judgment: bool = False
+    no_tools_below: float = 0.10  # must be near-certain before relaxing
+
+
+@dataclass
 class RoutingConfig:
     tiers: dict[str, Tier]
     default_tier: str = "cheap"      # tier used when signals are mixed
     enabled: bool = True             # global on/off switch
     explain: bool = True             # print routing decisions to the user
+    semantic: "SemanticConfig" = field(default_factory=lambda: SemanticConfig())
 
     def available_tiers(self) -> list[str]:
         """Tiers that have a configured model, in escalation order."""
@@ -102,6 +146,7 @@ class RoutingDecision:
     tier: str
     model: str
     reasons: list[str] = field(default_factory=list)
+    signals: object | None = None   # SemanticSignals, when the judge ran
 
     def explanation(self) -> str:
         if not self.reasons:
@@ -116,12 +161,18 @@ class Router:
 
     Routing logic, in order of precedence:
       1. Long context  (history big or single prompt huge)  -> flagship
-      2. Hard reasoning words / complex code present        -> flagship
-      3. Many turns deep into a complex thread               -> at least cheap
-      4. Easy words + short prompt + short history          -> local (or cheap)
-      5. Otherwise -> default tier
+      2. A semantic judgment, if a judge is configured and reachable
+      3. Hard reasoning words / complex code present        -> flagship
+      4. Many turns deep into a complex thread               -> at least cheap
+      5. Easy words + short prompt + short history          -> local (or cheap)
+      6. Otherwise -> default tier
     Any pick is then clamped to the available tiers (we never route to a tier
     the user hasn't configured).
+
+    Step 1 runs before step 2 on purpose. Length is a fact, not a judgment,
+    so asking a model about it would be both slower and less reliable — and
+    it means the longest prompts, the ones that would cost the most to send
+    to a judge, never get sent to one.
     """
 
     # Thresholds. Exposed as instance attrs so a future config can override.
@@ -131,8 +182,15 @@ class Router:
     SHORT_HISTORY_TURNS = 4
     MANY_TURNS = 10
 
-    def __init__(self, config: RoutingConfig) -> None:
+    def __init__(self, config: RoutingConfig,
+                 judge: object | None = None) -> None:
         self.config = config
+        self.judge = judge
+        """An object with ``.judge(prompt, history) -> SemanticSignals | None``.
+
+        Left as ``None`` (or returning ``None``) the router is exactly the
+        heuristic one it has always been. Typed loosely so importing the
+        router never pulls in the TypeSafe SDK."""
 
     def route(self, new_prompt: str,
               history: Iterable[ChatMessage],
@@ -145,7 +203,8 @@ class Router:
         reasons: list[str] = []
         chosen_tier: str | None = None
 
-        # 1. Long context — must escalate.
+        # 1. Long context — must escalate. Pure arithmetic: never asked of
+        #    a model, and short-circuits before any network call.
         if (prompt_chars >= self.LONG_PROMPT_CHARS
                 or history_chars >= self.LONG_HISTORY_CHARS):
             chosen_tier = "flagship"
@@ -153,9 +212,24 @@ class Router:
                 reasons.append(f"long prompt ({prompt_chars} chars)")
             if history_chars >= self.LONG_HISTORY_CHARS:
                 reasons.append(f"long history ({history_chars} chars)")
+            tier, model = self._resolve(chosen_tier, reasons,
+                                        need_tools=need_tools)
+            return RoutingDecision(tier=tier, model=model, reasons=reasons)
 
-        # 2. Hard reasoning / complex code signals.
-        elif _HARD_REASONING_WORDS.search(new_prompt):
+        # 2. Semantic judgment, when one is configured and reachable. A
+        #    None here (no judge, no key, timeout, rate limit) just falls
+        #    through to the heuristics below.
+        signals = self._consult_judge(new_prompt, history_list)
+        if signals is not None:
+            chosen_tier, need_tools = self._tier_from_signals(
+                signals, reasons, need_tools)
+            tier, model = self._resolve(chosen_tier, reasons,
+                                        need_tools=need_tools)
+            return RoutingDecision(tier=tier, model=model, reasons=reasons,
+                                   signals=signals)
+
+        # 3. Hard reasoning / complex code signals.
+        if _HARD_REASONING_WORDS.search(new_prompt):
             chosen_tier = "flagship"
             reasons.append("reasoning task")
         elif _CODE_FENCE.search(new_prompt) and _CODE_COMPLEXITY_HINTS.search(
@@ -166,19 +240,19 @@ class Router:
             chosen_tier = "flagship"
             reasons.append("substantial code block")
 
-        # 3. Deep into a complex conversation: don't downgrade.
+        # 4. Deep into a complex conversation: don't downgrade.
         elif turn_count >= self.MANY_TURNS:
             chosen_tier = "cheap" if self.config.default_tier == "local" else self.config.default_tier
             reasons.append(f"deep conversation ({turn_count} turns)")
 
-        # 4. Easy quick lookups.
+        # 5. Easy quick lookups.
         elif (_EASY_WORDS.search(new_prompt)
               and prompt_chars <= self.SHORT_PROMPT_CHARS
               and turn_count <= self.SHORT_HISTORY_TURNS):
             chosen_tier = "local"
             reasons.append("short factual question")
 
-        # 5. Default for everything else.
+        # 6. Default for everything else.
         if chosen_tier is None:
             chosen_tier = self.config.default_tier
 
@@ -186,6 +260,66 @@ class Router:
         chosen_tier, model = self._resolve(chosen_tier, reasons,
                                             need_tools=need_tools)
         return RoutingDecision(tier=chosen_tier, model=model, reasons=reasons)
+
+    # ----- semantic judgment -------------------------------------------
+
+    _ESCALATE = {"local": "cheap", "cheap": "flagship"}
+
+    def _consult_judge(self, new_prompt: str,
+                       history: list[ChatMessage]) -> object | None:
+        """Ask the judge, or return None if there isn't a usable one."""
+        if self.judge is None or not self.config.semantic.enabled:
+            return None
+        return self.judge.judge(new_prompt, history)  # type: ignore[attr-defined]
+
+    def _tier_from_signals(self, signals, reasons: list[str],
+                           need_tools: bool) -> tuple[str, bool]:
+        """Turn raw judgments into a tier. This is policy, not inference.
+
+        Every threshold read here lives in :class:`SemanticConfig`, so the
+        mapping can be re-tuned against a user's own transcripts without
+        asking the model anything new.
+        """
+        sem = self.config.semantic
+
+        if signals.difficulty >= sem.flagship_at:
+            tier = "flagship"
+        elif signals.difficulty <= sem.local_at:
+            tier = "local"
+        else:
+            tier = "cheap"
+        reasons.append(f"difficulty {signals.difficulty:.2f}")
+
+        # Spread probability means the model saw a case that genuinely sits
+        # between two levels. Hedge up rather than commit to the cheaper read.
+        if (signals.difficulty_confidence < sem.min_confidence
+                and tier in self._ESCALATE):
+            tier = self._ESCALATE[tier]
+            reasons.append(
+                f"low confidence ({signals.difficulty_confidence:.2f}), "
+                f"escalated to {tier}")
+
+        # Two things local models are specifically bad at, checked only when
+        # local is actually on the table.
+        if tier == "local":
+            if signals.needs_context >= sem.context_threshold:
+                tier = "cheap"
+                reasons.append("depends on earlier turns")
+            elif signals.program_reasoning >= sem.code_threshold:
+                tier = "cheap"
+                reasons.append("reasoning about code")
+
+        # ``need_tools`` arrives True whenever *any* MCP server is
+        # configured, which permanently excludes tiers that can't call
+        # tools. If the judge is near-certain this particular turn needs
+        # none, let the local tier back in. Off unless opted into, because
+        # being wrong here means the model can't reach a tool it wanted.
+        if (need_tools and sem.trust_tool_judgment
+                and signals.needs_tools <= sem.no_tools_below):
+            need_tools = False
+            reasons.append(f"no tools needed ({signals.needs_tools:.2f})")
+
+        return tier, need_tools
 
     def _resolve(self, requested: str, reasons: list[str],
                  need_tools: bool = False) -> tuple[str, str]:

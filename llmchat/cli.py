@@ -49,6 +49,7 @@ from .providers import (
     ProviderError,
 )
 from .routing import Router
+from .semantic_routing import make_judge
 from .storage import Store
 
 
@@ -318,6 +319,28 @@ def route_show(ctx: click.Context) -> None:
                       f"{tier.max_input_chars:,}", tier.description)
     console.print(table)
 
+    sem = cfg.semantic
+    if not sem.enabled:
+        console.print("[dim]semantic routing: off — heuristics only. "
+                      r"Enable it under \[semantic] in routing.toml.[/dim]")
+        return
+    judge = make_judge(sem)
+    if judge is not None and judge.available():
+        console.print(
+            f"semantic routing: [green]on[/green] via "
+            f"[cyan]{sem.model or 'jev-latest'}[/cyan]  "
+            f"[dim]local ≤ {sem.local_at} · flagship ≥ {sem.flagship_at} · "
+            f"min confidence {sem.min_confidence} · "
+            f"timeout {sem.timeout_seconds}s[/dim]")
+        if sem.trust_tool_judgment:
+            console.print(f"[dim]  tool judgment trusted below "
+                          f"{sem.no_tools_below} — turns judged not to need "
+                          f"a tool may route to a tool-less tier.[/dim]")
+    else:
+        reason = judge.unavailable_reason() if judge else "no judge"
+        console.print(f"semantic routing: [yellow]on but inactive[/yellow] "
+                      f"({reason}) — falling back to heuristics.")
+
 
 @route.command(name="init")
 @click.pass_context
@@ -339,11 +362,26 @@ def route_init(ctx: click.Context) -> None:
 @click.option("--history", "-h", multiple=True,
               help="Add a turn of fake history (repeatable). "
                    "Format: 'user:hello' or 'assistant:hi'.")
+@click.option("--semantic/--no-semantic", "semantic", default=None,
+              help="Override the [semantic] setting for this dry run. "
+                   "Handy for diffing the judge against the heuristics "
+                   "on the same prompt.")
 @click.pass_context
-def route_test(ctx: click.Context, prompt: str, history: tuple[str, ...]) -> None:
-    """Dry-run the router on a sample prompt — useful for tuning."""
+def route_test(ctx: click.Context, prompt: str, history: tuple[str, ...],
+               semantic: bool | None) -> None:
+    """Dry-run the router on a sample prompt — useful for tuning.
+
+    With semantic routing on this makes a real (paid) API call, so the
+    numbers it prints are the numbers the chat loop would have used.
+    """
     cfg = ctx.obj["routing_config"]
-    router = Router(cfg)
+    if semantic is not None:
+        cfg.semantic.enabled = semantic
+    judge = make_judge(cfg.semantic)
+    if judge is not None and not judge.available():
+        console.print(f"[yellow]semantic routing inactive: "
+                      f"{judge.unavailable_reason()}[/yellow]")
+    router = Router(cfg, judge=judge)
 
     msgs: list[ChatMessage] = []
     for h in history:
@@ -364,6 +402,20 @@ def route_test(ctx: click.Context, prompt: str, history: tuple[str, ...]) -> Non
         console.print(f"  → reasons: {', '.join(decision.reasons)}")
     else:
         console.print(f"  → reasons: (default tier)")
+
+    sig = decision.signals
+    if sig is not None:
+        console.print(f"  → judged by: [cyan]jev[/cyan]  {sig.summary()}")
+        if sig.probabilities:
+            spread = "  ".join(f"{lvl}:{pr:.2f}"
+                               for lvl, pr in sorted(sig.probabilities.items()))
+            console.print(f"  → difficulty spread: [dim]{spread}[/dim]")
+        if sig.cost_usd is not None:
+            console.print(f"  → judge cost: [dim]${sig.cost_usd:.6f} "
+                          f"({sig.input_tokens} input tokens)[/dim]")
+    elif cfg.semantic.enabled and judge is not None and judge.available():
+        why = judge.last_error or "a deterministic rule matched first"
+        console.print(f"  → [yellow]no judgment used[/yellow] [dim]({why})[/dim]")
 
 
 # ----- plugins subcommands --------------------------------------------------

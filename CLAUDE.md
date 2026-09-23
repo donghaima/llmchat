@@ -20,6 +20,7 @@ llmchat/
 ├── cli.py               # Click commands: new, resume, list, show, export, route, models
 ├── config.py            # Load/parse routing.toml config files
 ├── routing.py           # Heuristic router: pick tier based on prompt signals
+├── semantic_routing.py  # Optional TypeSafe System One judge behind the router
 ├── storage.py           # SQLite schema + Store class (sessions, messages)
 ├── providers/
 │   ├── base.py          # Provider ABC, ChatMessage, ProviderError
@@ -169,6 +170,10 @@ store.update_session_model/title/system_prompt(id, value)
 
 **Why No Classifier?** Classifiers are themselves LLM calls, which is the exact token tax we're avoiding. Heuristics get the easy 80% right for free. The ambiguous 20% intentionally goes to the configured default tier, a deliberate choice.
 
+**Optional Semantic Routing** (`semantic_routing.py`): That argument is about chat completions. A TypeSafe System One call returns a typed answer, bills nothing for output, and costs ~$0.00006/turn, so it's offered as an opt-in (`[semantic] enabled = true`). One request per turn asks four parallel questions: `difficulty` (a 0–2 `Score`), plus `needs_context`, `program_reasoning`, and `needs_tools` (`Noul`s). `Router._tier_from_signals()` maps those onto tiers — that mapping is *policy* and lives in `routing.py`, so thresholds can be retuned without new inference.
+
+Order matters: deterministic rules run **first**. Long-context escalation is arithmetic, so it short-circuits before any network call, keeping the priciest prompts off the judge entirely. Tier availability and tool support are resolved after. Every judge failure path (no SDK, no key, timeout, rate limit, bad response) returns `None` and falls back to the heuristics — routing can never break the chat. An auth failure permanently deactivates the judge for the session rather than paying the timeout on every turn.
+
 **Tier Configuration** (`routing.toml` under `~/.llmchat/`):
 ```toml
 default_tier = "cheap"
@@ -187,14 +192,22 @@ max_input_chars = 20000
 [tiers.flagship]
 model = "anthropic:claude-opus-4-7"
 max_input_chars = 200000
+
+[semantic]              # optional; off unless enabled
+enabled = true
+local_at = 0.6          # difficulty ≤ this → local
+flagship_at = 1.5       # difficulty ≥ this → flagship
+min_confidence = 0.5    # below this, escalate one tier
+trust_tool_judgment = false   # let a no-tools turn reach a tool-less tier
 ```
 
 **Router API**:
 ```python
-router = Router(config)
+router = Router(config, judge=make_judge(config.semantic))  # judge optional
 decision = router.route(prompt, chat_history, need_tools=False)
-# decision.tier, decision.model, decision.reasons
+# decision.tier, decision.model, decision.reasons, decision.signals
 ```
+`decision.signals` is a `SemanticSignals` when the judge ran, else `None`.
 
 ---
 
@@ -512,7 +525,9 @@ Set API keys and run `llmchat`. Every turn persists, so you can interrupt and re
 - Conversation pruning (drop old messages when context gets large)
 - Batch export to jsonl
 - Plugin dependency resolution
-- Custom routing thresholds in config (not just constants in code)
+- Custom heuristic thresholds in config (the `[semantic]` ones are already there)
+- Fold the semantic judge's cost into per-session cost totals (currently
+  reported only by `llmchat route test`)
 - Conversation search
 
 ---
@@ -546,6 +561,7 @@ Set API keys and run `llmchat`. Every turn persists, so you can interrupt and re
 - `google-genai>=0.3`
 - `httpx>=0.27`
 - `mcp` (for MCP servers)
+- `typesafe-sdk>=0.7` (semantic routing; `pip install 'llmchat[typesafe]'`)
 
 ---
 

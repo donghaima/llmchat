@@ -20,7 +20,10 @@ os.environ["LLMCHAT_DB"] = str(Path(_tmpdir) / "test.db")
 from llmchat.providers import ChatMessage  # noqa: E402
 from llmchat.providers.base import Provider  # noqa: E402
 from llmchat.routing import (  # noqa: E402
-    Router, RoutingConfig, Tier, default_config,
+    Router, RoutingConfig, SemanticConfig, Tier, default_config,
+)
+from llmchat.semantic_routing import (  # noqa: E402
+    SemanticJudge, SemanticSignals, make_judge,
 )
 from llmchat.storage import Store  # noqa: E402
 
@@ -725,6 +728,192 @@ def test_cli_plugins_list():
 
 # ----- run ------------------------------------------------------------------
 
+# ----- semantic routing tests -----------------------------------------------
+#
+# No network: a fake judge stands in for the TypeSafe client, exactly as
+# FakeProvider stands in for the chat providers. What is under test is the
+# policy in Router._tier_from_signals, not the model's judgment.
+
+def _semantic_config(**overrides) -> RoutingConfig:
+    cfg = _fake_routing_config()
+    cfg.semantic = SemanticConfig(enabled=True, **overrides)
+    return cfg
+
+
+def _signals(difficulty: float, confidence: float = 1.0, *,
+             needs_context: float = 0.0, program_reasoning: float = 0.0,
+             needs_tools: float = 0.0) -> SemanticSignals:
+    return SemanticSignals(
+        difficulty=difficulty,
+        difficulty_confidence=confidence,
+        needs_context=needs_context,
+        program_reasoning=program_reasoning,
+        needs_tools=needs_tools,
+        input_tokens=120,
+    )
+
+
+class FakeJudge:
+    """Returns canned signals and counts how often it was asked."""
+
+    def __init__(self, signals: SemanticSignals | None) -> None:
+        self.signals = signals
+        self.calls = 0
+
+    def judge(self, prompt, history):
+        self.calls += 1
+        return self.signals
+
+
+def test_semantic_difficulty_bands():
+    """The three bands of the 0-2 difficulty line map onto the three tiers."""
+    for difficulty, expected in [(0.1, "local"), (1.0, "cheap"),
+                                 (1.9, "flagship")]:
+        judge = FakeJudge(_signals(difficulty))
+        router = Router(_semantic_config(), judge=judge)
+        d = router.route("anything at all", [])
+        assert d.tier == expected, \
+            f"difficulty {difficulty} routed to {d.tier}, expected {expected}"
+        assert judge.calls == 1
+        assert d.signals is not None
+    print("  semantic: difficulty bands -> tiers OK")
+
+
+def test_semantic_low_confidence_escalates():
+    """A split distribution hedges upward rather than trusting the midpoint."""
+    judge = FakeJudge(_signals(0.2, confidence=0.3))
+    router = Router(_semantic_config(), judge=judge)
+    d = router.route("short thing", [])
+    assert d.tier == "cheap", f"expected escalation to cheap, got {d.tier}"
+    assert any("low confidence" in r for r in d.reasons), d.reasons
+    print("  semantic: low confidence escalates a tier OK")
+
+
+def test_semantic_context_and_code_lift_local():
+    """Local is skipped for turns it is specifically bad at."""
+    judge = FakeJudge(_signals(0.1, needs_context=0.95))
+    d = Router(_semantic_config(), judge=judge).route("and the other one?", [])
+    assert d.tier == "cheap"
+    assert any("earlier turns" in r for r in d.reasons), d.reasons
+
+    judge = FakeJudge(_signals(0.1, program_reasoning=0.9))
+    d = Router(_semantic_config(), judge=judge).route("why is it slow", [])
+    assert d.tier == "cheap"
+    assert any("code" in r for r in d.reasons), d.reasons
+    print("  semantic: context/code signals lift local -> cheap OK")
+
+
+def test_semantic_beats_heuristic_on_disguised_prompt():
+    """The case the regexes get wrong: hard question, easy-looking words."""
+    prompt = "why does this hang sometimes"
+
+    heuristic = Router(_fake_routing_config()).route(prompt, [])
+    judge = FakeJudge(_signals(1.8, program_reasoning=0.95))
+    semantic = Router(_semantic_config(), judge=judge).route(prompt, [])
+
+    assert heuristic.tier == "cheap", \
+        f"heuristic baseline changed: {heuristic.tier}"
+    assert semantic.tier == "flagship", \
+        f"semantic router should have caught this, got {semantic.tier}"
+    print("  semantic: catches a prompt the heuristics misread OK")
+
+
+def test_semantic_falls_back_when_judge_returns_none():
+    """A timeout, rate limit, or bad key must not change routing behavior."""
+    judge = FakeJudge(None)
+    router = Router(_semantic_config(), judge=judge)
+    d = router.route("Please analyze this carefully.", [])
+    assert judge.calls == 1, "judge should have been asked"
+    assert d.tier == "flagship", "should fall through to the heuristics"
+    assert d.signals is None
+    print("  semantic: falls back to heuristics when the judge fails OK")
+
+
+def test_semantic_skipped_when_disabled():
+    """enabled = false means the judge is never even consulted."""
+    cfg = _fake_routing_config()          # semantic defaults to off
+    judge = FakeJudge(_signals(1.9))
+    d = Router(cfg, judge=judge).route("what is 2 + 2?", [])
+    assert judge.calls == 0, "disabled semantic routing still called the judge"
+    assert d.tier == "local", "should have used the heuristic path"
+    print("  semantic: not consulted when disabled OK")
+
+
+def test_deterministic_rules_run_before_the_judge():
+    """Long prompts short-circuit: no judgment asked, no tokens spent."""
+    judge = FakeJudge(_signals(0.0))   # would have said "local"
+    router = Router(_semantic_config(), judge=judge)
+    d = router.route("x " * 3000, [])
+    assert judge.calls == 0, \
+        "long prompt should short-circuit before paying for a judgment"
+    assert d.tier == "flagship"
+    print("  semantic: deterministic length rule runs first OK")
+
+
+def _tool_less_local_config(**overrides) -> RoutingConfig:
+    """Like the real default config: the local tier cannot call tools."""
+    cfg = _semantic_config(**overrides)
+    cfg.tiers["local"] = Tier("local", "fake:fake-tiny", 4_000,
+                              supports_tools=False)
+    return cfg
+
+
+def test_semantic_tool_relaxation():
+    """need_tools can be relaxed, but only when opted in and near-certain."""
+    signals = _signals(0.1, needs_tools=0.02)
+
+    # Default: MCP configured pins every turn above the tool-less local tier.
+    d = Router(_tool_less_local_config(),
+               judge=FakeJudge(signals)).route(
+        "what is a mutex", [], need_tools=True)
+    assert d.tier == "cheap", f"expected cheap without opt-in, got {d.tier}"
+
+    # Opted in: a turn judged to need no tool may use local.
+    cfg = _tool_less_local_config(trust_tool_judgment=True)
+    d = Router(cfg, judge=FakeJudge(signals)).route(
+        "what is a mutex", [], need_tools=True)
+    assert d.tier == "local", f"expected local with opt-in, got {d.tier}"
+    assert any("no tools needed" in r for r in d.reasons), d.reasons
+
+    # Still opted in, but the judge is unsure: the constraint holds.
+    unsure = _signals(0.1, needs_tools=0.4)
+    d = Router(cfg, judge=FakeJudge(unsure)).route(
+        "what is in the config file", [], need_tools=True)
+    assert d.tier == "cheap", f"unsure judge should not unlock local: {d.tier}"
+
+    # And the relaxation never overrides a tier the user hasn't configured.
+    cfg.tiers["local"] = Tier("local", None, 4_000, supports_tools=False)
+    d = Router(cfg, judge=FakeJudge(signals)).route(
+        "what is a mutex", [], need_tools=True)
+    assert d.tier == "cheap", f"unconfigured local should not be used: {d.tier}"
+    print("  semantic: tool relaxation is opt-in and conservative OK")
+
+
+def test_judge_unavailable_without_key():
+    """No API key, no crash — just an inactive judge with a reason to show."""
+    saved = os.environ.pop("TYPESAFE_API_KEY", None)
+    try:
+        judge = SemanticJudge()
+        assert not judge.available()
+        assert "TYPESAFE_API_KEY" in (judge.unavailable_reason() or "")
+        assert judge.judge("anything", []) is None
+    finally:
+        if saved is not None:
+            os.environ["TYPESAFE_API_KEY"] = saved
+    assert make_judge(SemanticConfig(enabled=False)) is None
+    print("  semantic: judge inactive without a key, make_judge respects off OK")
+
+
+def test_signals_cost_and_summary():
+    sig = _signals(1.43, confidence=0.35)
+    assert sig.cost_usd is not None
+    # 120 input tokens at $0.042 per million.
+    assert abs(sig.cost_usd - 120 / 1_000_000 * 0.042) < 1e-12
+    assert "difficulty 1.43" in sig.summary()
+    assert SemanticSignals(0.0, 0.0, 0.0, 0.0, 0.0).cost_usd is None
+    print("  semantic: cost + summary OK")
+
+
 if __name__ == "__main__":
     print("running smoke tests against", os.environ["LLMCHAT_DB"])
     print()
@@ -741,6 +930,18 @@ if __name__ == "__main__":
     test_router_escalates_when_tier_missing()
     test_router_falls_back_when_flagship_missing()
     test_router_code_with_complexity_to_flagship()
+    print()
+    print("semantic routing:")
+    test_semantic_difficulty_bands()
+    test_semantic_low_confidence_escalates()
+    test_semantic_context_and_code_lift_local()
+    test_semantic_beats_heuristic_on_disguised_prompt()
+    test_semantic_falls_back_when_judge_returns_none()
+    test_semantic_skipped_when_disabled()
+    test_deterministic_rules_run_before_the_judge()
+    test_semantic_tool_relaxation()
+    test_judge_unavailable_without_key()
+    test_signals_cost_and_summary()
     print()
     print("chat loop integration:")
     test_chat_loop_uses_router_by_default()
