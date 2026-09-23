@@ -35,6 +35,7 @@ from .providers import (
 )
 from . import pricing
 from .routing import Router, RoutingConfig
+from .semantic_routing import make_judge
 from .storage import Session, Store
 
 
@@ -87,7 +88,8 @@ class ChatLoop:
         self.store = store
         self.console = console or Console()
         self.routing_config = routing_config
-        self.router = Router(routing_config)
+        self.judge = make_judge(routing_config.semantic)
+        self.router = Router(routing_config, judge=self.judge)
         self.ext = extensions
         self.state = ChatState(session=session, pinned_model=None,
                                approval=ApprovalState())
@@ -109,6 +111,11 @@ class ChatLoop:
 
     def run(self) -> None:
         self._print_header()
+        if self.judge is not None and not self.judge.available():
+            self.console.print(
+                f"[yellow]semantic routing is enabled but inactive: "
+                f"{self.judge.unavailable_reason()}[/yellow]\n"
+                f"[dim]falling back to heuristic routing.[/dim]")
         while True:
             try:
                 line = self.prompt_session.prompt(self._prompt_str())
@@ -923,6 +930,25 @@ class ChatLoop:
             self.console.print(
                 f"  [cyan]{tier_name}[/cyan]: {tier.model} "
                 f"[dim](≤ {tier.max_input_chars} chars)[/dim]{tools_tag}")
+
+        sem = cfg.semantic
+        if not sem.enabled:
+            self.console.print(
+                "  [dim]semantic: off (heuristics only)[/dim]")
+        elif self.judge is not None and self.judge.available():
+            model = sem.model or "jev-latest"
+            self.console.print(
+                f"  [cyan]semantic[/cyan]: on via {model} "
+                f"[dim](local ≤ {sem.local_at}, flagship ≥ {sem.flagship_at}, "
+                f"min confidence {sem.min_confidence})[/dim]")
+            if self.judge.last_error:
+                self.console.print(
+                    f"  [dim]last judge error: {self.judge.last_error}[/dim]")
+        else:
+            reason = (self.judge.unavailable_reason()
+                      if self.judge is not None else "no judge")
+            self.console.print(f"  [yellow]semantic: on but inactive "
+                               f"({reason})[/yellow]")
 
 
 def run_chat(store: Store, session: Session,

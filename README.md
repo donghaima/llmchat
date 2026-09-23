@@ -100,8 +100,8 @@ back to `cheap`. The reason is shown in the explanation.
 
 ### Why no classifier?
 
-Some routers use a small LLM to classify each prompt before routing. We
-deliberately don't:
+Some routers use a small LLM to classify each prompt before routing. By
+default we don't:
 
 - It adds an extra API call to every turn (the thing we're trying to avoid).
 - A classifier needs to be capable enough to be reliable, which costs real
@@ -111,6 +111,57 @@ deliberately don't:
 
 The heuristic gets the easy 80% right for free. The middle 20% goes to the
 default tier, which is a deliberate, predictable choice.
+
+### Optional: semantic routing
+
+Those three objections are about *chat completions*. They don't all hold for
+a [TypeSafe](https://typesafe.ai) System One call, which returns a typed
+answer instead of prose, bills nothing for output tokens, and costs about
+**$0.00006 a turn** — roughly 15,000 routing decisions per dollar, against a
+single wrongly-flagship turn costing more than all of them together.
+
+So it's available as an opt-in. It earns its keep on the prompts the regexes
+read wrong in both directions:
+
+| prompt | heuristic | semantic |
+| --- | --- | --- |
+| `why does this hang sometimes` | cheap — no reasoning word, 28 chars | flagship — debugging from symptoms |
+| `summarize this incident review` | local — matches `summarize` | cheap or flagship, depending on what follows |
+
+Turn it on:
+
+```bash
+pip install 'llmchat[typesafe]'
+export TYPESAFE_API_KEY=...        # console.typesafe.ai
+llmchat route init                 # then set enabled = true under [semantic]
+```
+
+Per turn it asks one request containing four parallel questions — how much
+capability the request needs (a 0–2 `Score`), and three `Noul`s for whether
+it depends on earlier turns, needs real reasoning about code, and needs a
+tool. Code still owns everything deterministic: length limits short-circuit
+*before* the call, so the longest prompts never become the priciest
+judgments, and tier availability and tool support are resolved afterward.
+
+When the model splits its probability across difficulty levels, the router
+escalates one tier rather than trusting the midpoint — a needless flagship
+turn costs cents, a botched local one costs you another round trip.
+
+**It cannot break your chat.** No API key, SDK not installed, timeout, rate
+limit, or unexpected response all fall straight back to the heuristics.
+`llmchat route show` tells you which path is actually live, and
+`llmchat route test --semantic / --no-semantic` diffs the two on one prompt:
+
+```bash
+llmchat route test --semantic "why does this hang sometimes"
+#   → tier: flagship
+#   → judged by: jev  difficulty 1.62 (conf 0.71), context 0.12, code 0.94, tools 0.31
+#   → difficulty spread: 0:0.02  1:0.34  2:0.64
+#   → judge cost: $0.000050 (1180 input tokens)
+```
+
+Every threshold lives under `[semantic]` in `routing.toml`. They're policy,
+not inference — retuning one re-reads signals the model already gave you.
 
 ## Usage
 
@@ -136,9 +187,10 @@ llmchat export 7f3a > chat.md
 # See what models are available
 llmchat models
 
-# Inspect / test routing without making API calls
+# Inspect / test routing (no API calls unless semantic routing is on)
 llmchat route show
 llmchat route test "what is 2 + 2?"
+llmchat route test --semantic "why does this hang sometimes"
 llmchat route test "Analyze the trade-offs step by step."
 llmchat route test "fix this bug" --history "user:huge codebase context here"
 ```

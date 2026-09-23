@@ -40,6 +40,10 @@ _PRICES: dict[str, ModelPrice] = {
     "google:gemini-2.5-pro": ModelPrice(1.25, 10.0),
     "google:gemini-2.5-flash": ModelPrice(0.30, 2.50),
     "google:gemini-2.5-flash-lite": ModelPrice(0.10, 0.40),
+    # TypeSafe System One — used by the router's semantic judge, never as a
+    # chat model. Output tokens are free; it returns typed answers, not text.
+    "typesafe:jev-latest": ModelPrice(0.042, 0.0),
+    "typesafe:jev-preview": ModelPrice(0.042, 0.0),
 }
 
 _FREE = ModelPrice(0.0, 0.0)
